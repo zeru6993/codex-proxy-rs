@@ -8,7 +8,7 @@ umask 0077
 
 REPO="${CPR_RELEASE_REPOSITORY:-zeru6993/codex-proxy-rs}"
 [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
-  echo 'CPR_RELEASE_REPOSITORY must be owner/repository' >&2
+  echo 'CPR_RELEASE_REPOSITORY 必须为 owner/repository' >&2
   exit 1
 }
 CPR_RELEASE_TAG="${CPR_RELEASE_TAG:-}"

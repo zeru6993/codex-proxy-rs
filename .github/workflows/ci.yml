@@ -44,6 +44,7 @@ jobs:
         id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
+          base: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.sha }}
           # 目录规则取并集，再统一排除说明文档，保留隐藏配置
           predicate-quantifier: some-with-excludes
           filters: |

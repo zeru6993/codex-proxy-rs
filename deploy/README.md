@@ -897,7 +897,8 @@ python3 apply-image.py --manifest deployment.json \
 `apply-image.py` 用于已运行的实例，不负责创建数据库或初始化配置
 
 dev 镜像使用 `source` 构建类型，管理端按现有策略禁用在线替换程序；后续升级统一部署新的镜像摘要。
-完整多平台 Release 是独立的手动发布入口，镜像和来源随当前 GitHub 仓库生成。
+完整多平台 Release 是独立的手动发布入口，请从 `dev` 调用 `release/publish`，或在 Release 工作流中显式选择 `dev`；
+镜像和来源随当前 GitHub 仓库生成，`main` 保留上游发布配置。
 独立插件仍需提交到插件仓库、构建并安装到实例，主程序镜像不包含本地未提交文件或插件工作区
 
 ### 升级前检查
