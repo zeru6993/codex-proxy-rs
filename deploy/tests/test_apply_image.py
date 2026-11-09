@@ -37,6 +37,7 @@ class DeploymentTests(unittest.TestCase):
         self.bad_infrastructure = False
         self.failed_start = False
         self.changed_compose = False
+        self.missing_admin_key = False
         self.base = {"services": {
             "postgres": {"image": "postgres:18", "volumes": ["unchanged-database"]},
             "redis": {"image": "redis:8", "volumes": ["unchanged-cache"]},
@@ -73,7 +74,7 @@ class DeploymentTests(unittest.TestCase):
         if "up" in args and self.failed_start:
             raise RuntimeError("application did not become healthy")
         if "postgres" in args and "exec" in args:
-            return "private-admin-key"
+            return "" if self.missing_admin_key else "private-admin-key"
         if args[-1].endswith("/system/version"):
             return json.dumps({"data": {"gitSha": "wrong" if self.bad_runtime else self.manifest["git_sha"], "version": self.manifest["version"]}})
         if args[-1].endswith("/update/detail"):
@@ -115,6 +116,15 @@ class DeploymentTests(unittest.TestCase):
             APP.deploy(self.manifest, self.compose, apply=True)
         self.assertEqual(self.compose.read_bytes(), self.original)
         self.assertFalse(any("up" in call for call in self.calls))
+
+    @patch.object(APP, "run")
+    def test_missing_admin_key_is_rejected_before_replacing_app(self, run):
+        run.side_effect = self.docker
+        self.missing_admin_key = True
+        with self.assertRaisesRegex(ValueError, "管理员 API Key"):
+            APP.deploy(self.manifest, self.compose, apply=True)
+        self.assertEqual(self.compose.read_bytes(), self.original)
+        self.assertFalse(any("pull" in call or "up" in call for call in self.calls))
 
     @patch.object(APP, "run")
     def test_infrastructure_change_is_rejected_before_pull(self, run):

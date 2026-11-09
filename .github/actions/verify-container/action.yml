@@ -187,23 +187,27 @@ runs:
         EXPECTED_BUILD_TYPE: ${{ inputs.expected-build-type }}
       run: |
         set -euo pipefail
-        compose=(docker compose --project-name "$COMPOSE_PROJECT_NAME" -f deploy/compose.yaml)
-        admin_key="$("${compose[@]}" exec -T -e PGPASSWORD="$CI_POSTGRES_PASSWORD" postgres \
-          psql -At -U codex_proxy -d codex_proxy -c 'SELECT admin_api_key FROM runtime_settings WHERE id = 1')"
-        test -n "$admin_key"
-        echo "::add-mask::$admin_key"
-        "${compose[@]}" exec -T codex-proxy-rs curl --fail --silent --show-error --max-time 20 \
-          -H "x-api-key: $admin_key" http://127.0.0.1:8080/api/admin/system/version | ruby -rjson -e '
+        # 新实例尚未设置管理 API Key，使用本次隔离环境的管理员登录会话
+        cookie_file="$(mktemp)"
+        trap 'rm -f "$cookie_file"' EXIT
+        login_body="$(ruby -rjson -e 'puts JSON.generate(mode: "admin", password: ENV.fetch("CI_ADMIN_PASSWORD"))')"
+        curl --fail --silent --show-error --max-time 20 --cookie-jar "$cookie_file" \
+          -H 'Content-Type: application/json' -H 'Origin: http://127.0.0.1:8080' \
+          --data "$login_body" http://127.0.0.1:8080/api/auth/login > /dev/null
+        curl --fail --silent --show-error --max-time 20 --cookie "$cookie_file" \
+          http://127.0.0.1:8080/api/admin/system/version | ruby -rjson -e '
             data = JSON.parse(STDIN.read).fetch("data")
             abort "Running Git SHA differs" unless data.fetch("gitSha") == ENV.fetch("EXPECTED_GIT_SHA")
             abort "Running version differs" unless data.fetch("version") == ENV.fetch("EXPECTED_VERSION")'
-        "${compose[@]}" exec -T codex-proxy-rs curl --fail --silent --show-error --max-time 20 \
-          -H "x-api-key: $admin_key" http://127.0.0.1:8080/api/admin/system/update/detail | ruby -rjson -e '
+        curl --fail --silent --show-error --max-time 20 --cookie "$cookie_file" \
+          http://127.0.0.1:8080/api/admin/system/update/detail | ruby -rjson -e '
             data = JSON.parse(STDIN.read).fetch("data")
             abort "Build type differs" unless data.fetch("buildType") == ENV.fetch("EXPECTED_BUILD_TYPE")
             if ENV.fetch("EXPECTED_BUILD_TYPE") == "source"
               abort "Source build permits online replacement" if data.fetch("updateSupported")
             end'
+        curl --fail --silent --show-error --max-time 20 --cookie "$cookie_file" \
+          -X POST http://127.0.0.1:8080/api/auth/logout > /dev/null
 
     - name: Verify clean logs and graceful shutdown
       shell: bash

@@ -867,7 +867,8 @@ docker compose -f deploy/compose.yaml build codex-proxy-rs
 - `apply-image.py`：现有实例的应用镜像升级工具
 - `checksums.txt`：附件文件的 SHA-256
 
-在附件目录验证文件并检查升级计划，需要 Python 3、Docker Compose 和现有 Compose 中的 PostgreSQL 服务：
+在附件目录验证文件并检查升级计划，需要 Python 3、Docker Compose 和现有 Compose 中的 PostgreSQL 服务。
+部署验收使用已配置的管理员 API Key；未配置时在拉取镜像和修改文件前拒绝执行：
 
 ```bash
 sha256sum --check --strict checksums.txt

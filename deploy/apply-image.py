@@ -92,6 +92,13 @@ def verify_image(manifest):
         raise ValueError("镜像平台不匹配")
 
 
+def read_admin_key(compose):
+    key = run(compose_command(compose) + ["exec", "-T", "postgres", "sh", "-c", 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql -X -At -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT admin_api_key FROM runtime_settings WHERE id = 1"']).strip()
+    if not key:
+        raise ValueError("运行身份验收需要管理员 API Key，请先在管理端配置后再部署")
+    return key
+
+
 @contextlib.contextmanager
 def deployment_lock(compose, apply):
     if not apply:
@@ -126,6 +133,8 @@ def deploy(manifest, compose, apply=False, wait_timeout=600):
             if not container:
                 raise ValueError("应用尚未运行，请先按部署文档完成初始化")
             current = json.loads(run(["docker", "inspect", container]))[0]
+            # 在拉取镜像和修改部署文件前核对验收凭据，避免健康实例因缺少凭据而中途失败
+            read_admin_key(compose)
             stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             record = history / (stamp + "-" + manifest["git_sha"][:12])
             record.mkdir(mode=0o700)
@@ -145,9 +154,7 @@ def deploy(manifest, compose, apply=False, wait_timeout=600):
                 # 依赖服务和数据目录保持现状，仅重建应用，避免顺带升级数据库或 Redis
                 run(compose_command(compose) + ["up", "-d", "--no-deps", "--no-build", "--pull", "never", "--wait", "--wait-timeout", str(wait_timeout), SERVICE], timeout=wait_timeout + 30)
                 running = run(compose_command(compose) + ["ps", "-q", SERVICE]).strip()
-                admin_key = run(compose_command(compose) + ["exec", "-T", "postgres", "sh", "-c", 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql -X -At -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT admin_api_key FROM runtime_settings WHERE id = 1"']).strip()
-                if not admin_key:
-                    raise ValueError("无法读取运行身份核验所需的管理员凭据")
+                admin_key = read_admin_key(compose)
                 curl = ["docker", "exec", "-i", running, "curl", "--config", "-", "--fail", "--silent", "--show-error", "--max-time", "15"]
                 header = "header = " + json.dumps("x-api-key: " + admin_key) + "\n"
                 identity = json.loads(run(curl + ["http://127.0.0.1:8080/api/admin/system/version"], input=header))["data"]
