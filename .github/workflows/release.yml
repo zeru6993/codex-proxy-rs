@@ -44,7 +44,7 @@ jobs:
       docker_platforms: ${{ steps.version.outputs.docker_platforms }}
       previous_tag: ${{ steps.version.outputs.previous_tag }}
       prerelease: ${{ steps.version.outputs.prerelease }}
-      build_type: ${{ steps.version.outputs.build_type }}
+      build_type: ${{ github.repository == 'zyycn/codex-proxy-rs' && steps.version.outputs.build_type || 'source' }}
       rust: ${{ steps.toolchains.outputs.rust }}
       rust_image: ${{ steps.toolchains.outputs.rust_image }}
       run_backend: ${{ steps.quality.outputs.run_backend }}
@@ -562,13 +562,14 @@ jobs:
         run: ruby .github/scripts/publish-release.rb
 
       - name: Publish verified channels to main
+        if: github.repository == 'zyycn/codex-proxy-rs'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.release-info.outputs.version }}
         run: ruby .github/scripts/published-channels.rb publish "$VERSION"
 
   recover-index:
-    if: inputs.index_only
+    if: inputs.index_only && github.repository == 'zyycn/codex-proxy-rs'
     runs-on: ubuntu-26.04
     concurrency:
       group: release-publication

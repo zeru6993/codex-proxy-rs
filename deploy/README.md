@@ -849,7 +849,7 @@ docker compose -f deploy/compose.yaml build codex-proxy-rs
 
 ### dev 镜像发布与部署
 
-`main` 用于同步上游，`dev` 保存本仓库的集成改动。将改动提交并推送到 `origin/dev` 后，
+自有仓库默认分支为 `dev`；`main` 用于同步上游，`dev` 保存本仓库的集成改动。将改动提交并推送到 `origin/dev` 后，
 [CI](https://github.com/zeru6993/codex-proxy-rs/actions/workflows/ci.yml) 按该次提交执行后端检查、依赖安全审计、前端构建与容器运行验收。
 也可在 Actions 中选择 `dev` 分支手动运行 CI。PR 运行只检查，不发布镜像
 
@@ -896,9 +896,9 @@ python3 apply-image.py --manifest deployment.json \
 跳过该节的 Release 下载步骤。配置完成后执行 `docker compose -f deploy/compose.yaml up -d --no-build --wait`；
 `apply-image.py` 用于已运行的实例，不负责创建数据库或初始化配置
 
-dev 镜像使用 `source` 构建类型，管理端按现有策略禁用在线替换程序；后续升级统一部署新的镜像摘要。
+自有镜像和完整 Release 使用 `source` 构建类型，管理端按现有策略禁用在线替换程序；后续升级统一部署新的镜像摘要或完整发行包。
 完整多平台 Release 是独立的手动发布入口，请从 `dev` 调用 `release/publish`，或在 Release 工作流中显式选择 `dev`；
-镜像和来源随当前 GitHub 仓库生成，`main` 保留上游发布配置。
+镜像和来源随当前 GitHub 仓库生成，`main` 保留上游发布配置。自有发版不回写 `main` 的在线更新索引。
 独立插件仍需提交到插件仓库、构建并安装到实例，主程序镜像不包含本地未提交文件或插件工作区
 
 ### 升级前检查
@@ -946,7 +946,7 @@ alpha、beta、rc、exp 在 GitHub 标记为 Pre-release，不覆盖 GitHub Late
 
 ### 管理端在线更新
 
-本节适用于完整 Release 构建；dev 镜像按[部署清单](#dev-镜像发布与部署)升级
+本节适用于上游官方 Release 构建；自有版本按[部署清单](#dev-镜像发布与部署)或完整发行包升级
 
 在线更新要求官方构建且起始版本不低于 **v3.18.1**，版本选择遵循上述规则；源码等非官方构建返回不支持原因，不提供可用更新。
 不满足在线更新条件时，使用完整发行包或镜像[手动部署](#镜像升级与源码构建)。

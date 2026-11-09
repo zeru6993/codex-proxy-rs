@@ -1,7 +1,8 @@
 require 'json'
 require 'open3'
+require 'uri'
 
-# 仅复用同一源码的主分支 CI，缺少证据时完整检查发行提交
+# 仅复用同一源码在当前发行分支的 CI，缺少证据时完整检查发行提交
 module ReleaseQuality
   def self.capture(*command)
     output, error, status = Open3.capture3(*command)
@@ -17,7 +18,8 @@ module ReleaseQuality
     return nil if changes.empty? || (changes - %w[release/version.yaml release/notes.md]).any?
 
     # 按最新一次运行判断，失败或仍在执行时不回退到旧的成功记录
-    endpoint = "repos/#{repository}/actions/workflows/ci.yml/runs?event=push&branch=main&head_sha=#{parent}&per_page=1"
+    branch = URI.encode_www_form_component(ENV.fetch('GITHUB_REF_NAME', 'main'))
+    endpoint = "repos/#{repository}/actions/workflows/ci.yml/runs?event=push&branch=#{branch}&head_sha=#{parent}&per_page=1"
     run = JSON.parse(capture('gh', 'api', endpoint)).fetch('workflow_runs').first
     return nil unless run && run.fetch('head_sha') == parent && run.fetch('conclusion') == 'success'
     return nil unless run.fetch('head_repository').fetch('full_name') == repository
