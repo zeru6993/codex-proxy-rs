@@ -2,16 +2,23 @@ require 'digest'
 require 'fileutils'
 require_relative 'release-metadata'
 
-# dev 镜像与部署清单共用源码身份，清单只在质量、安全与运行验收通过后生成
+# 发行镜像与部署清单共用源码身份，清单只在质量、安全与运行验收通过后生成
 module DevImage
+  def self.release_ref?
+    ref = ENV.fetch('GITHUB_REF', '')
+    event = ENV.fetch('GITHUB_EVENT_NAME', '')
+    %w[push workflow_dispatch].include?(event) &&
+      (ref.match?(%r{\Arefs/heads/release/.+\z}) ||
+       ref.match?(/\Arefs\/tags\/v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\z/))
+  end
+
   def self.identity
     sha = ENV.fetch('CPR_GIT_SHA')
     raise 'Expected an exact commit SHA' unless sha.match?(/\A[a-f0-9]{40}\z/) && ReleaseMetadata.git('rev-parse', 'HEAD') == sha
     repository = ENV.fetch('GITHUB_REPOSITORY').downcase
     raise 'Invalid repository' unless repository.match?(/\A[a-z0-9_.-]+\/[a-z0-9_.-]+\z/)
     if ENV['PUBLISH_IMAGE'] == 'true'
-      raise 'Only dev push or manual builds may publish' unless ENV['GITHUB_REF'] == 'refs/heads/dev' &&
-        %w[push workflow_dispatch].include?(ENV['GITHUB_EVENT_NAME'])
+      raise 'Only release/* branches or version tags may publish' unless release_ref?
     end
     [sha, repository]
   end
@@ -27,6 +34,7 @@ module DevImage
   end
 
   def self.deployment
+    raise 'Only release/* branches or version tags may produce deployment files' unless release_ref?
     sha, repository = identity
     digest = ENV.fetch('VERIFIED_IMAGE_DIGEST')
     raise 'Invalid verified image digest' unless digest.match?(/\Asha256:[a-f0-9]{64}\z/)
@@ -47,7 +55,7 @@ module DevImage
     File.write("#{directory}/compose.yaml", compose.sub(default, image))
     FileUtils.cp('deploy/config.example.yaml', directory)
     FileUtils.cp('deploy/apply-image.py', directory)
-    File.write("#{directory}/summary.md", "源码：`#{sha}`\n\n版本：`#{version}`\n\n镜像：`#{image}`\n\n部署清单与工具见本次运行的 dev-deployment 附件，生产升级执行 `python3 apply-image.py --manifest deployment.json --compose /opt/codex-proxy-rs/deploy/compose.yaml --apply`\n")
+    File.write("#{directory}/summary.md", "源码：`#{sha}`\n\n版本：`#{version}`\n\n镜像：`#{image}`\n\n部署清单与工具见本次运行的 release-deployment 附件，生产升级执行 `python3 apply-image.py --manifest deployment.json --compose /opt/codex-proxy-rs/deploy/compose.yaml --apply`\n")
     checksums = Dir.glob("#{directory}/*").sort.reject { |p| File.basename(p) == 'checksums.txt' }.map do |path|
       "#{Digest::SHA256.file(path).hexdigest}  #{File.basename(path)}\n"
     end
@@ -57,8 +65,9 @@ end
 
 if $PROGRAM_NAME == __FILE__
   case ARGV
+  when ['eligible'] then puts "publish=#{DevImage.release_ref?}"
   when ['metadata'] then DevImage.metadata.each { |key, value| puts "#{key}=#{value}" }
   when ['deployment'] then DevImage.deployment
-  else abort 'usage: dev-image.rb metadata|deployment'
+  else abort 'usage: dev-image.rb eligible|metadata|deployment'
   end
 end

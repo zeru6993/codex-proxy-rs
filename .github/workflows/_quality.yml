@@ -257,6 +257,7 @@ jobs:
           shopt -s globstar nullglob
           for script in .github/**/*.sh; do bash -n "$script"; done
           for script in .github/scripts/*.rb; do ruby -c "$script"; done
+          ruby .github/scripts/tests/release-ref.rb
           ruby .github/scripts/toolchains.rb
           ruby -c backend/crates/gateway-plugin/runtime/plugin-api-lifecycle.rb
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s deploy/tests -v

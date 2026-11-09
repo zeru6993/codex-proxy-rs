@@ -812,7 +812,7 @@ OAuth 恢复开关为 `host.logging.oauth_recovery`，默认关闭，与普通�
 
 ## 镜像升级与源码构建
 
-本仓库的自维护实例使用下节的 dev 部署清单。完整 Release 的安装脚本默认从
+本仓库的自维护实例使用下节的镜像部署清单。完整 Release 的安装脚本默认从
 `zeru6993/codex-proxy-rs` 获取附件，可用 `CPR_RELEASE_REPOSITORY` 显式指定其他仓库
 
 每个 Release 独立提供 `config.example.yaml`、默认镜像固定到该版本的 `compose.yaml` 和校验和；
@@ -847,11 +847,20 @@ CPR_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 docker compose -f deploy/compose.yaml build codex-proxy-rs
 ```
 
-### dev 镜像发布与部署
+### 镜像发布与部署
 
-自有仓库默认分支为 `dev`；`main` 用于同步上游，`dev` 保存本仓库的集成改动。将改动提交并推送到 `origin/dev` 后，
-[CI](https://github.com/zeru6993/codex-proxy-rs/actions/workflows/ci.yml) 按该次提交执行后端检查、依赖安全审计、前端构建与容器运行验收。
-也可在 Actions 中选择 `dev` 分支手动运行 CI。PR 运行只检查，不发布镜像
+自有仓库默认分支为 `dev`；`main` 用于同步上游，`dev` 保存本仓库的集成改动。
+普通 `dev` 推送、PR 和手动运行只执行代码检查，不打包或发布镜像，也不更新生产
+
+准备发布时，将选定的 `dev` 提交推送到 `release/*` 分支，或为该提交打 `vX.Y.Z` 形式的版本标签（支持 `-self.N` 等后缀）。
+[CI](https://github.com/zeru6993/codex-proxy-rs/actions/workflows/ci.yml) 自动执行完整后端检查、依赖安全审计、前端构建和容器运行验收。
+例如选择当前已推送的 `dev` 提交创建发行分支：
+
+```bash
+git push origin dev:refs/heads/release/3.43.1-self.1
+```
+
+也可在 Actions 中选择已存在的 `release/*` 分支或版本标签重跑 CI。PR 即使目标是 release 分支也不打包或发布
 
 通过全部检查后，CI 将同一份经过运行验收的 Linux amd64 镜像推送到
 `ghcr.io/zeru6993/codex-proxy-rs`，标签为 `sha-<完整提交>-<运行号>-<重试号>`。
@@ -860,7 +869,8 @@ docker compose -f deploy/compose.yaml build codex-proxy-rs
 工作流使用仓库的 `GITHUB_TOKEN` 写入 GHCR，无需保存发布 PAT。GHCR 包需设为公开，或在生产主机用具备该包只读权限的凭据登录；
 包可见性和仓库可见性分别配置。部署工具沿用主机的 Docker 登录状态，不保存注册表凭据
 
-从成功的 CI 运行下载 `dev-deployment-<提交>-<运行号>-<重试号>` 附件并解压，其中包含：
+CI 发布镜像和部署附件后，由运维明确选择该摘要升级生产；推送发行分支或标签本身不自动连接生产服务器。
+从成功的 CI 运行下载 `release-deployment-<提交>-<运行号>-<重试号>` 附件并解压，其中包含：
 
 - `deployment.json`：源码提交、构建版本、镜像摘要与 CI 运行链接
 - `compose.yaml`、`config.example.yaml`：该提交的部署文件与配置模板
@@ -898,7 +908,7 @@ python3 apply-image.py --manifest deployment.json \
 `apply-image.py` 用于已运行的实例，不负责创建数据库或初始化配置
 
 自有镜像和完整 Release 使用 `source` 构建类型，管理端按现有策略禁用在线替换程序；后续升级统一部署新的镜像摘要或完整发行包。
-完整多平台 Release 是独立的手动发布入口，请从 `dev` 调用 `release/publish`，或在 Release 工作流中显式选择 `dev`；
+完整多平台 Release 是独立的手动发布入口，请从 `release/*` 分支调用 `release/publish`，或在 Release 工作流中显式选择发行分支或版本标签；
 镜像和来源随当前 GitHub 仓库生成，`main` 保留上游发布配置。自有发版不回写 `main` 的在线更新索引。
 独立插件仍需提交到插件仓库、构建并安装到实例，主程序镜像不包含本地未提交文件或插件工作区
 
@@ -947,7 +957,7 @@ alpha、beta、rc、exp 在 GitHub 标记为 Pre-release，不覆盖 GitHub Late
 
 ### 管理端在线更新
 
-本节适用于上游官方 Release 构建；自有版本按[部署清单](#dev-镜像发布与部署)或完整发行包升级
+本节适用于上游官方 Release 构建；自有版本按[部署清单](#镜像发布与部署)或完整发行包升级
 
 在线更新要求官方构建且起始版本不低于 **v3.18.1**，版本选择遵循上述规则；源码等非官方构建返回不支持原因，不提供可用更新。
 不满足在线更新条件时，使用完整发行包或镜像[手动部署](#镜像升级与源码构建)。

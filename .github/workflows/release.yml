@@ -24,7 +24,17 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  release-ref:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Require an explicit release ref for this fork
+        if: github.repository != 'zyycn/codex-proxy-rs'
+        run: test "$(ruby .github/scripts/dev-image.rb eligible)" = publish=true
+
   release-info:
+    needs: release-ref
     if: ${{ !inputs.index_only }}
     runs-on: ubuntu-26.04
     timeout-minutes: 10
