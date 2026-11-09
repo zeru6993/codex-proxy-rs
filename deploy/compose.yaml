@@ -68,7 +68,7 @@ services:
     extends:
       file: config.yaml
       service: app-runtime
-    image: ${CPR_IMAGE:-ghcr.io/zyycn/codex-proxy-rs:latest}
+    image: ${CPR_IMAGE:-ghcr.io/zeru6993/codex-proxy-rs:latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -77,7 +77,7 @@ services:
         CPR_VERSION: ${CPR_VERSION:-}
         CPR_GIT_SHA: ${CPR_GIT_SHA:-unknown}
         CPR_BUILD_TIME: ${CPR_BUILD_TIME:-unknown}
-        CPR_BUILD_TYPE: ${CPR_BUILD_TYPE:-release}
+        CPR_BUILD_TYPE: ${CPR_BUILD_TYPE:-source}
     restart: unless-stopped
     user: '10001:10001'
     init: true
@@ -125,11 +125,11 @@ services:
       CPR_DATABASE_URL: postgres://codex_proxy@postgres:5432/codex_proxy
       CPR_REDIS_URL: redis://redis:6379/
       CPR_DEPLOYMENT_MODE: docker
-      CPR_UPDATE_REPOSITORY: zyycn/codex-proxy-rs
+      CPR_UPDATE_REPOSITORY: zeru6993/codex-proxy-rs
       CPR_GITHUB_API_BASE: https://api.github.com/repos
       CPR_UPDATE_EXE_PATH: /app/bin/codex-proxy-rs
       CPR_WEB_DIST_DIR: /app/web/dist
-      CPR_ENABLE_SELF_RESTART: 'true'
+      CPR_ENABLE_SELF_RESTART: 'false'
     logging: *json-logging
 
 configs:

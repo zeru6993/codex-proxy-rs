@@ -21,7 +21,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: zyycn/codex-proxy-rs
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   release-info:
@@ -368,7 +368,7 @@ jobs:
             org.opencontainers.image.title=Codex Proxy RS
             org.opencontainers.image.version=${{ needs.release-info.outputs.version }}
             org.opencontainers.image.revision=${{ needs.release-info.outputs.git_sha }}
-            org.opencontainers.image.source=https://github.com/zyycn/codex-proxy-rs
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ needs.release-info.outputs.git_sha }}-${{ matrix.arch }}
 
       - name: Verify exact app image digest

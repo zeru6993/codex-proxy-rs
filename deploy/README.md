@@ -243,11 +243,11 @@ flowchart LR
 mkdir -p codex-proxy-rs/deploy && cd codex-proxy-rs
 
 # 只解析一次最新正式版本，确保两个文件来自同一 Release。
-CPR_RELEASE_URL="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/zyycn/codex-proxy-rs/releases/latest)"
+CPR_RELEASE_URL="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/zeru6993/codex-proxy-rs/releases/latest)"
 CPR_RELEASE_TAG="${CPR_RELEASE_URL##*/}"
-curl -fsSL "https://github.com/zyycn/codex-proxy-rs/releases/download/${CPR_RELEASE_TAG}/compose.yaml" \
+curl -fsSL "https://github.com/zeru6993/codex-proxy-rs/releases/download/${CPR_RELEASE_TAG}/compose.yaml" \
   -o deploy/compose.yaml
-curl -fsSL "https://github.com/zyycn/codex-proxy-rs/releases/download/${CPR_RELEASE_TAG}/config.example.yaml" \
+curl -fsSL "https://github.com/zeru6993/codex-proxy-rs/releases/download/${CPR_RELEASE_TAG}/config.example.yaml" \
   -o deploy/config.example.yaml
 
 install -d -m 0750 .runtime/postgres .runtime/redis
@@ -318,7 +318,7 @@ store:
 发行包提供 Windows x64（`windows_amd64`）和 ARM64（`windows_arm64`）版本，按运行机器的 CPU 架构选择。
 需先准备可访问的 PostgreSQL 和 Redis，创建数据库及用户；使用数据库备份功能时，还需将匹配服务端版本的 `pg_dump` 加入 `PATH`
 
-从 [Release 附件](https://github.com/zyycn/codex-proxy-rs/releases) 下载对应的
+从 [Release 附件](https://github.com/zeru6993/codex-proxy-rs/releases) 下载对应的
 `codex-proxy-rs_<version>_windows_<arch>.tar.gz`，解压后保留 `codex-proxy-rs.exe`、`web/dist`、`deploy` 和 `plugins/official` 的目录关系。
 在解压后的 `codex-proxy-rs` 目录中打开 PowerShell，首次安装时创建配置：
 
@@ -812,6 +812,9 @@ OAuth 恢复开关为 `host.logging.oauth_recovery`，默认关闭，与普通�
 
 ## 镜像升级与源码构建
 
+本仓库的自维护实例使用下节的 dev 部署清单。完整 Release 的安装脚本默认从
+`zeru6993/codex-proxy-rs` 获取附件，可用 `CPR_RELEASE_REPOSITORY` 显式指定其他仓库
+
 每个 Release 独立提供 `config.example.yaml`、默认镜像固定到该版本的 `compose.yaml` 和校验和；
 各平台归档也包含 `deploy/config.example.yaml`。配置模板来自构建该版本的同一提交。
 使用二进制归档手动部署时，将模板中的 `api.asset_directory` 改为 `../web/dist`，指向归档内的静态资源。
@@ -844,6 +847,59 @@ CPR_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 docker compose -f deploy/compose.yaml build codex-proxy-rs
 ```
 
+### dev 镜像发布与部署
+
+`main` 用于同步上游，`dev` 保存本仓库的集成改动。将改动提交并推送到 `origin/dev` 后，
+[CI](https://github.com/zeru6993/codex-proxy-rs/actions/workflows/ci.yml) 按该次提交执行后端检查、依赖安全审计、前端构建与容器运行验收。
+也可在 Actions 中选择 `dev` 分支手动运行 CI。PR 运行只检查，不发布镜像
+
+通过全部检查后，CI 将同一份经过运行验收的 Linux amd64 镜像推送到
+`ghcr.io/zeru6993/codex-proxy-rs`，标签为 `sha-<完整提交>-<运行号>-<重试号>`。
+每次运行有独立标签，生产部署使用镜像摘要。版本带 `+git.<提交前12位>`，管理端提交号为完整 SHA
+
+工作流使用仓库的 `GITHUB_TOKEN` 写入 GHCR，无需保存发布 PAT。GHCR 包需设为公开，或在生产主机用具备该包只读权限的凭据登录；
+包可见性和仓库可见性分别配置。部署工具沿用主机的 Docker 登录状态，不保存注册表凭据
+
+从成功的 CI 运行下载 `dev-deployment-<提交>-<运行号>-<重试号>` 附件并解压，其中包含：
+
+- `deployment.json`：源码提交、构建版本、镜像摘要与 CI 运行链接
+- `compose.yaml`、`config.example.yaml`：该提交的部署文件与配置模板
+- `apply-image.py`：现有实例的应用镜像升级工具
+- `checksums.txt`：附件文件的 SHA-256
+
+在附件目录验证文件并检查升级计划，需要 Python 3、Docker Compose 和现有 Compose 中的 PostgreSQL 服务：
+
+```bash
+sha256sum --check --strict checksums.txt
+python3 apply-image.py --manifest deployment.json \
+  --compose /opt/codex-proxy-rs/deploy/compose.yaml
+```
+
+省略 `--apply` 时只校验清单和 Compose 变更，不拉取镜像、替换文件或重建容器。
+先按[备份与恢复](#备份与恢复)完成备份，确认维护窗口后执行：
+
+```bash
+python3 apply-image.py --manifest deployment.json \
+  --compose /opt/codex-proxy-rs/deploy/compose.yaml --apply
+```
+
+工具拉取清单指定的摘要，核对镜像平台、提交、版本和来源后，将现有 Compose 中的应用镜像固定到该摘要，
+更新仓库设为本仓库，关闭管理端自重启。它校验其他生效配置保持不变，仅重建应用，保留数据库、Redis、挂载与业务配置。
+启动后通过已配置的本地 PostgreSQL 获取管理员凭据，使用标准输入请求版本接口，不把凭据写入命令行或部署记录，
+核对实际进程的提交、版本、更新策略及 `/readyz`
+
+每次执行的原 Compose、旧镜像引用、目标清单和结果保存在安装目录 `.runtime/deployments/`。
+默认等待启动 600 秒，可用 `--wait-timeout` 调整。启动失败会保留目标配置与现场；数据库可能已执行迁移，
+回滚时需先按[人工恢复数据库](#人工恢复数据库)判断是否还原升级前数据库，再恢复匹配的旧部署，不自动换回旧程序
+
+首次安装时使用附件中的固定摘要 `compose.yaml` 和配置模板，按[手动安装](#手动安装)准备目录、密码和权限，
+跳过该节的 Release 下载步骤。配置完成后执行 `docker compose -f deploy/compose.yaml up -d --no-build --wait`；
+`apply-image.py` 用于已运行的实例，不负责创建数据库或初始化配置
+
+dev 镜像使用 `source` 构建类型，管理端按现有策略禁用在线替换程序；后续升级统一部署新的镜像摘要。
+完整多平台 Release 是独立的手动发布入口，镜像和来源随当前 GitHub 仓库生成。
+独立插件仍需提交到插件仓库、构建并安装到实例，主程序镜像不包含本地未提交文件或插件工作区
+
 ### 升级前检查
 
 - OpenAI 或 xAI 授权使用已保存代理，且代理的 WebSocket 连接上限非零：升级或回退后，重新发起尚未完成的授权，不复用旧回调或授权码。上限为 `0` 的在途授权和已保存的账号、凭据不受影响
@@ -873,7 +929,7 @@ docker compose -f deploy/compose.yaml build codex-proxy-rs
 自定义更新仓库须提供这份清单和候选版本的公开 Release。发布工作流在安装包公开并通过校验后更新 `published`，需要具有写入 `main` 的权限
 
 提示有更新前会按精确 tag 核对候选 Release、当前平台包和校验文件，无需配置 GitHub 令牌。GitHub 限流时按提示稍后重试；
-也可从[发行页](https://github.com/zyycn/codex-proxy-rs/releases)下载平台归档，按[手动安装](#手动安装)升级
+也可从[发行页](https://github.com/zeru6993/codex-proxy-rs/releases)下载平台归档，按[手动安装](#手动安装)升级
 
 同一 `X.Y.Z-exp.N` 系列只用于同一轮实验，不能混用不同实验分支；变更基线即进入另一实验线，需手动迁移。
 exp 不进入正式版、alpha、beta 或 rc，普通实例也不能选择 Exp。
@@ -888,6 +944,8 @@ alpha、beta、rc、exp 在 GitHub 标记为 Pre-release，不覆盖 GitHub Late
 升级前核对目标版本的数据库要求；可连续升级的发行线与约束见[迁移冻结规则](../backend/migrations/README.md#冻结规则)
 
 ### 管理端在线更新
+
+本节适用于完整 Release 构建；dev 镜像按[部署清单](#dev-镜像发布与部署)升级
 
 在线更新要求官方构建且起始版本不低于 **v3.18.1**，版本选择遵循上述规则；源码等非官方构建返回不支持原因，不提供可用更新。
 不满足在线更新条件时，使用完整发行包或镜像[手动部署](#镜像升级与源码构建)。
@@ -924,8 +982,8 @@ Compose 提供以下在线更新运行参数：
   `CPR_WEB_DIST_DIR` 同时供页面服务与更新器使用，相对路径以 `deploy/config.yaml` 所在目录为基准
 - 更新临时目录、状态文件和锁文件默认由 `host.runtime_data_dir` 派生；
   `CPR_UPDATE_TEMP_DIR`、`CPR_UPDATE_STATE_FILE`、`CPR_UPDATE_LOCK_FILE` 仅用于显式覆盖
-- `CPR_ENABLE_SELF_RESTART=true`：更新或回滚完成后允许管理端请求重启；Docker 进程退出后由
-  Compose 的 `restart: unless-stopped` 拉起新进程
+- `CPR_ENABLE_SELF_RESTART`：本仓库 Compose 默认为 `false`；完整 Release 需要管理端自重启时显式设为 `true`，
+  进程退出后由 Compose 的 `restart: unless-stopped` 拉起新进程
 
 管理端自重启遵循统一的[停止与重启](#停止与重启)策略，客户端需在新进程完成迁移与初始化后重新连接
 

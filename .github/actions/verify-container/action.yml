@@ -10,6 +10,15 @@ inputs:
   artifact-name:
     description: Unique diagnostics artifact name within the workflow run
     required: true
+  expected-git-sha:
+    description: Verify the running process belongs to this source commit
+    default: ''
+  expected-version:
+    description: Verify the running process reports this build version
+    default: ''
+  expected-build-type:
+    description: Verify the update policy of the running build
+    default: ''
 runs:
   using: composite
   steps:
@@ -168,6 +177,33 @@ runs:
           fix_runtime_permissions
         )
         "${compose[@]}" up -d --no-build --wait codex-proxy-rs
+
+    - name: Verify running build identity and update policy
+      if: inputs.expected-git-sha != ''
+      shell: bash
+      env:
+        EXPECTED_GIT_SHA: ${{ inputs.expected-git-sha }}
+        EXPECTED_VERSION: ${{ inputs.expected-version }}
+        EXPECTED_BUILD_TYPE: ${{ inputs.expected-build-type }}
+      run: |
+        set -euo pipefail
+        compose=(docker compose --project-name "$COMPOSE_PROJECT_NAME" -f deploy/compose.yaml)
+        admin_key="$("${compose[@]}" exec -T -e PGPASSWORD="$CI_POSTGRES_PASSWORD" postgres \
+          psql -At -U codex_proxy -d codex_proxy -c 'SELECT admin_api_key FROM runtime_settings WHERE id = 1')"
+        test -n "$admin_key"
+        echo "::add-mask::$admin_key"
+        "${compose[@]}" exec -T codex-proxy-rs curl --fail --silent --show-error --max-time 20 \
+          -H "x-api-key: $admin_key" http://127.0.0.1:8080/api/admin/system/version | ruby -rjson -e '
+            data = JSON.parse(STDIN.read).fetch("data")
+            abort "Running Git SHA differs" unless data.fetch("gitSha") == ENV.fetch("EXPECTED_GIT_SHA")
+            abort "Running version differs" unless data.fetch("version") == ENV.fetch("EXPECTED_VERSION")'
+        "${compose[@]}" exec -T codex-proxy-rs curl --fail --silent --show-error --max-time 20 \
+          -H "x-api-key: $admin_key" http://127.0.0.1:8080/api/admin/system/update/detail | ruby -rjson -e '
+            data = JSON.parse(STDIN.read).fetch("data")
+            abort "Build type differs" unless data.fetch("buildType") == ENV.fetch("EXPECTED_BUILD_TYPE")
+            if ENV.fetch("EXPECTED_BUILD_TYPE") == "source"
+              abort "Source build permits online replacement" if data.fetch("updateSupported")
+            end'
 
     - name: Verify clean logs and graceful shutdown
       shell: bash

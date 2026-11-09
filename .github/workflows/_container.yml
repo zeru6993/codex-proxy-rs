@@ -11,12 +11,40 @@ on:
         description: Validate the complete Docker source build
         type: boolean
         default: true
+      export_image:
+        description: Export the tested dev image for a separate publishing job
+        type: boolean
+        default: false
+    outputs:
+      version:
+        value: ${{ jobs.metadata.outputs.version }}
+      build_time:
+        value: ${{ jobs.metadata.outputs.build_time }}
+      image_tag:
+        value: ${{ jobs.metadata.outputs.image_tag }}
 
 permissions:
   contents: read
   security-events: write
 
 jobs:
+  metadata:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      build_time: ${{ steps.metadata.outputs.build_time }}
+      image_tag: ${{ steps.metadata.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - id: metadata
+        env:
+          CPR_GIT_SHA: ${{ inputs.ref }}
+          PUBLISH_IMAGE: ${{ inputs.export_image }}
+        run: ruby .github/scripts/dev-image.rb metadata >> "$GITHUB_OUTPUT"
+
   frontend:
     if: ${{ !inputs.source_build }}
     runs-on: ubuntu-26.04
@@ -32,6 +60,7 @@ jobs:
           upload-artifact: 'true'
 
   binary:
+    needs: metadata
     if: ${{ !inputs.source_build }}
     runs-on: ubuntu-26.04
     timeout-minutes: 45
@@ -49,6 +78,9 @@ jobs:
           rust-image: ${{ steps.toolchains.outputs.rust_image }}
         env:
           CPR_GIT_SHA: ${{ inputs.ref }}
+          CPR_VERSION: ${{ needs.metadata.outputs.version }}
+          CPR_BUILD_TIME: ${{ needs.metadata.outputs.build_time }}
+          CPR_BUILD_TYPE: source
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: codex-proxy-rs-linux-amd64
@@ -57,8 +89,11 @@ jobs:
           retention-days: 7
 
   container:
-    needs: [frontend, binary]
+    needs: [metadata, frontend, binary]
     if: always() && !cancelled()
+    permissions:
+      contents: read
+      security-events: write
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     env:
@@ -66,6 +101,11 @@ jobs:
       TRIVY_QUIET: 'true'
       TRIVY_SKIP_VERSION_CHECK: 'true'
     steps:
+      - name: Require build metadata
+        env:
+          METADATA_RESULT: ${{ needs.metadata.result }}
+        run: test "$METADATA_RESULT" = success
+
       # 上游失败必须传递给已有的容器检查，不能让必需状态变成 skipped
       - name: Require prebuilt inputs
         if: ${{ !inputs.source_build }}
@@ -103,10 +143,11 @@ jobs:
           MATRIX_OS: linux
           MATRIX_ARCH: amd64
           MATRIX_BINARY: codex-proxy-rs
+          CPR_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           ruby -r './.github/scripts/release-metadata' -e '
             ReleaseMetadata.seal_manifest(
-              "version" => ReleaseMetadata.version(YAML.load_file("release/version.yaml").fetch("version")),
+              "version" => ENV.fetch("CPR_VERSION"),
               "git_sha" => ReleaseMetadata.git("rev-parse", "HEAD")
             )'
           ruby .github/scripts/package-release.rb image
@@ -120,6 +161,14 @@ jobs:
           build-args: |
             CPR_PREBUILT_DIR=dist/docker
             CPR_GIT_SHA=${{ inputs.ref }}
+            CPR_VERSION=${{ needs.metadata.outputs.version }}
+            CPR_BUILD_TIME=${{ needs.metadata.outputs.build_time }}
+            CPR_BUILD_TYPE=source
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ inputs.ref }}
+            org.opencontainers.image.version=${{ needs.metadata.outputs.version }}
+            io.codex-proxy.build-type=source
           load: true
           tags: ${{ env.CPR_IMAGE }}
           no-cache-filters: |
@@ -127,7 +176,7 @@ jobs:
             runtime
             runtime-prebuilt
           cache-from: type=gha,scope=runtime-${{ inputs.source_build && 'source' || 'prebuilt' }}
-          cache-to: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope=runtime-{0}', inputs.source_build && 'source' || 'prebuilt') || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') && format('type=gha,mode=max,scope=runtime-{0}', inputs.source_build && 'source' || 'prebuilt') || '' }}
 
       - name: Verify runtime image
         uses: ./.github/actions/verify-container
@@ -135,3 +184,25 @@ jobs:
           image: ${{ env.CPR_IMAGE }}
           platform: linux/amd64
           artifact-name: container-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-amd64
+          expected-git-sha: ${{ inputs.ref }}
+          expected-version: ${{ needs.metadata.outputs.version }}
+          expected-build-type: source
+
+      - name: Export the tested image
+        if: inputs.export_image
+        run: |
+          set -euo pipefail
+          docker image inspect "$CPR_IMAGE" --format '{{.Id}}' > "$RUNNER_TEMP/verified-image-id.txt"
+          docker save "$CPR_IMAGE" --output "$RUNNER_TEMP/verified-image.tar"
+
+      - name: Upload the tested image
+        if: inputs.export_image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verified-dev-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/verified-image.tar
+            ${{ runner.temp }}/verified-image-id.txt
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

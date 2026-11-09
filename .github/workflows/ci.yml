@@ -4,12 +4,15 @@ on:
   push:
     branches:
       - main
+      - dev
     paths-ignore:
       - 'release/version.yaml'
       - 'release/notes.md'
   pull_request:
     branches:
       - main
+      - dev
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -73,6 +76,7 @@ jobs:
               - '.github/scripts/toolchains.rb'
               - '.github/scripts/package-release.rb'
               - '.github/scripts/release-metadata.rb'
+              - '.github/scripts/dev-image.rb'
               - '.github/workflows/_container.yml'
               - '.github/workflows/ci.yml'
               - '!**/*.md'
@@ -98,13 +102,26 @@ jobs:
     uses: ./.github/workflows/_quality.yml
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      run_backend: ${{ needs.changes.outputs.backend == 'true' }}
+      run_backend: ${{ needs.changes.outputs.backend == 'true' || (github.ref == 'refs/heads/dev' && github.event_name != 'pull_request') }}
       # 预构建容器复用同一次前端检查产物，源码 Docker 构建仍独立验证
       run_frontend: ${{ needs.changes.outputs.frontend == 'true' && (needs.changes.outputs.container != 'true' || needs.changes.outputs.source_container == 'true') }}
 
+  dev-security:
+    if: github.ref == 'refs/heads/dev' && github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/security.yml
+    with:
+      ref: ${{ github.sha }}
+
   container:
-    needs: changes
-    if: needs.changes.outputs.container == 'true'
+    needs: [changes, quality, dev-security]
+    if: >-
+      always() && !cancelled() && needs.quality.result == 'success' &&
+      (needs.dev-security.result == 'success' || needs.dev-security.result == 'skipped') &&
+      (needs.changes.outputs.container == 'true' ||
+       (github.ref == 'refs/heads/dev' && github.event_name != 'pull_request'))
     permissions:
       contents: read
       security-events: write
@@ -112,3 +129,61 @@ jobs:
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       source_build: ${{ needs.changes.outputs.source_container == 'true' }}
+      export_image: ${{ github.ref == 'refs/heads/dev' && github.event_name != 'pull_request' && github.repository != 'zyycn/codex-proxy-rs' }}
+
+  publish-dev:
+    needs: container
+    if: github.ref == 'refs/heads/dev' && github.event_name != 'pull_request' && github.repository != 'zyycn/codex-proxy-rs'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: verified-dev-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Load the tested image without rebuilding
+        env:
+          LOCAL_IMAGE: codex-proxy-rs:ci-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker load --input "$RUNNER_TEMP/verified-image.tar"
+          test "$(docker image inspect "$LOCAL_IMAGE" --format '{{.Id}}')" = "$(cat "$RUNNER_TEMP/verified-image-id.txt")"
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the verified image
+        id: publish
+        env:
+          LOCAL_IMAGE: codex-proxy-rs:ci-${{ github.sha }}
+          IMAGE_TAG: ${{ needs.container.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          docker tag "$LOCAL_IMAGE" "$IMAGE_TAG"
+          docker push "$IMAGE_TAG"
+          digest="$(docker buildx imagetools inspect "$IMAGE_TAG" --format '{{ .Manifest.Digest }}')"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Prepare immutable deployment files
+        env:
+          CPR_GIT_SHA: ${{ github.sha }}
+          CPR_VERSION: ${{ needs.container.outputs.version }}
+          CPR_BUILD_TIME: ${{ needs.container.outputs.build_time }}
+          VERIFIED_IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          ruby .github/scripts/dev-image.rb deployment
+          cat dist/deployment/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dev-deployment-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/deployment/
+          if-no-files-found: error
+          retention-days: 90

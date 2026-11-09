@@ -7,9 +7,9 @@
 
 面向 Codex 的自托管多账号 AI 网关
 
-[![CI](https://github.com/zyycn/codex-proxy-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/zyycn/codex-proxy-rs/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/zyycn/codex-proxy-rs?display_name=tag&sort=semver&style=flat-square)](https://github.com/zyycn/codex-proxy-rs/releases)
-[![GHCR](https://img.shields.io/badge/GHCR-codex--proxy--rs-2496ED?logo=docker&logoColor=white&style=flat-square)](https://github.com/zyycn/codex-proxy-rs/pkgs/container/codex-proxy-rs)
+[![CI](https://github.com/zeru6993/codex-proxy-rs/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/zeru6993/codex-proxy-rs/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/zeru6993/codex-proxy-rs?display_name=tag&sort=semver&style=flat-square)](https://github.com/zeru6993/codex-proxy-rs/releases)
+[![GHCR](https://img.shields.io/badge/GHCR-codex--proxy--rs-2496ED?logo=docker&logoColor=white&style=flat-square)](https://github.com/zeru6993/codex-proxy-rs/pkgs/container/codex-proxy-rs)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
 
 [快速预览](#快速预览) · [快速开始](#快速开始) · [客户端接入](#客户端接入) · [文档](#文档) · [社区](#社区) · [许可证](#许可证)
@@ -36,11 +36,18 @@
 
 ## 快速开始
 
+本仓库的自维护镜像从 `dev` 构建，质量、安全和容器验收通过后生成固定摘要的部署附件。
+日常安装与升级见 [dev 镜像发布与部署](deploy/README.md#dev-镜像发布与部署)，生产使用其中的 `deployment.json`，包含提交到 `dev` 的主程序改动
+
+### 完整 Release 安装
+
+以下方式适用于本仓库已发布完整 Release 的版本；dev 镜像附件从上面的 CI 入口获取
+
 使用 Docker Compose 部署版本固定的发布镜像，同时启动 PostgreSQL 和 Redis
 
 以下命令适用于 Linux amd64/arm64，需要 Docker Engine、Docker Compose Plugin、curl 和 OpenSSL
 
-macOS 从[发行页](https://github.com/zyycn/codex-proxy-rs/releases)下载对应的归档：Intel 机型选 `darwin_amd64`，Apple Silicon 机型选 `darwin_arm64`。
+macOS 从[发行页](https://github.com/zeru6993/codex-proxy-rs/releases)下载对应的归档：Intel 机型选 `darwin_amd64`，Apple Silicon 机型选 `darwin_arm64`。
 Windows x64 / ARM64 的安装步骤见 [Windows 二进制部署](deploy/README.md#windows-二进制部署)
 
 已有部署请先看 [升级说明](deploy/README.md#镜像升级与源码构建)，不要覆盖原配置
@@ -50,7 +57,7 @@ Windows x64 / ARM64 的安装步骤见 [Windows 二进制部署](deploy/README.m
 请确保当前用户能访问 Docker，并可通过 `sudo` 或 root 设置目录权限
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zyycn/codex-proxy-rs/main/deploy/install.sh -o install.sh && bash install.sh
+curl -fsSL https://raw.githubusercontent.com/zeru6993/codex-proxy-rs/dev/deploy/install.sh -o install.sh && bash install.sh
 ```
 
 [安装脚本](deploy/install.sh) 默认安装到当前目录下的 `codex-proxy-rs/`，下载同一正式 Release 的部署文件，
@@ -64,6 +71,7 @@ curl -fsSL https://raw.githubusercontent.com/zyycn/codex-proxy-rs/main/deploy/in
 | --- | --- | --- |
 | `INSTALL_DIR` | 安装目录，建议使用绝对路径 | 当前目录下的 `codex-proxy-rs/` |
 | `CPR_RELEASE_TAG` | 指定发布标签 | 最新正式版本 |
+| `CPR_RELEASE_REPOSITORY` | 完整 Release 所属仓库 | `zeru6993/codex-proxy-rs` |
 | `ADMIN_PASSWORD` | 管理员初始密码，至少 12 位，不能包含 `$`，不能使用常见弱口令 | 随机生成 |
 
 例如，自定义安装目录：
