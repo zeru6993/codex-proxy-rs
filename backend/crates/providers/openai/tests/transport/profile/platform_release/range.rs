@@ -1,10 +1,11 @@
 //! 验证 HTTP Range 的 ETag、精确范围与取消传播
 
 use provider_openai::transport::profile::platform_release::range::RemoteFile;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use wiremock::{
@@ -52,6 +53,87 @@ async fn ranged_reads_require_one_etag_and_the_exact_requested_range() {
             .await
             .unwrap();
         assert_eq!(result.is_err(), fails);
+    }
+}
+
+#[tokio::test]
+async fn failed_ranges_log_received_bytes_and_cause_without_changing_reader_errors() {
+    for (case, reason, bytes_read) in [
+        ("stall", "timeout", 2),
+        ("disconnect", "connection_interrupted", 2),
+        ("changed", "etag_mismatch", 0),
+        ("precondition", "etag_mismatch", 0),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/?private-marker", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for first in [true, false] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut headers = BufReader::new(&mut socket).lines();
+                while let Some(line) = headers.next_line().await.unwrap() {
+                    if line.is_empty() {
+                        break;
+                    }
+                }
+                let reply = if first {
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/10\r\nContent-Length: 1\r\nETag: \"one\"\r\nConnection: close\r\n\r\nx"
+                } else if case == "precondition" {
+                    "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else if case == "changed" {
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-9/10\r\nContent-Length: 7\r\nETag: \"secret-tag\"\r\nConnection: close\r\n\r\n1234567"
+                } else {
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-9/10\r\nContent-Length: 7\r\nETag: \"one\"\r\nConnection: close\r\n\r\nab"
+                };
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                if !first && case == "stall" {
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .read_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let mut reader = RemoteFile::open(client, url, CancellationToken::new())
+            .await
+            .unwrap();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(std::sync::Mutex::new(log.reopen().unwrap()))
+            .finish();
+        let error = tokio::task::spawn_blocking(move || {
+            tracing::subscriber::with_default(subscriber, || {
+                reader.seek(SeekFrom::Start(3)).unwrap();
+                reader.read_exact(&mut [0; 7]).unwrap_err()
+            })
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut failures = records
+            .iter()
+            .map(|entry| &entry["fields"])
+            .filter(|fields| fields["message"] == "Desktop artifact range failed");
+        let fields = failures.next().expect("range failure must be logged");
+        assert!(failures.next().is_none());
+        assert_eq!(fields["range_start"], 3);
+        assert_eq!(fields["range_end"], 9);
+        assert_eq!(fields["reason"], reason);
+        assert_eq!(fields["bytes_read"], bytes_read);
+        assert!(!fields["cause"].as_str().unwrap().is_empty());
+        assert!(!text.contains("private-marker") && !text.contains("secret-tag"));
+        if reason == "etag_mismatch" {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        } else {
+            assert_eq!(error.to_string(), "官方 Desktop 制品读取失败");
+        }
     }
 }
 
