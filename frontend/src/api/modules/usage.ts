@@ -80,7 +80,10 @@ export interface UsageRecordMetadata {
 
 export type UsageRecordStatus = 'success' | 'error' | 'all'
 
+export type UsageErrorOrigin = 'proxy' | 'upstream' | 'connection' | 'unknown'
+
 export interface UsageErrorFacts {
+  errorOrigin: UsageErrorOrigin
   errorCode: string | null
   errorKind: string | null
   websocketCloseCode: number | null
@@ -91,6 +94,8 @@ export interface UsageErrorFacts {
 
 export interface UsageListRecord extends UsageErrorFacts {
   logicalOutcome: string
+  clientStatusCode: number | null
+  upstreamStatusCode: number | null
   errorMessage: string | null
   clientApiKeyName: string | null
   id: string
@@ -201,7 +206,7 @@ export interface UsageAttempt {
   transport: string
   sendState: string
   outcome: string
-  downstreamCommitted: boolean
+  downstreamCommitted: boolean | null
   statusCode: number | null
   providerErrorCode: string | null
   failureClass: string | null
@@ -420,9 +425,10 @@ interface PageQuery {
 
 type UsagePageQuery = UsageRangeQuery & PageQuery & {
   clientApiKeyName?: string
-  accountName?: string
+  accountSearch?: string
   model?: string
   status?: UsageRecordStatus
+  errorOrigin?: UsageErrorOrigin
 }
 
 interface UsageDetailQuery {

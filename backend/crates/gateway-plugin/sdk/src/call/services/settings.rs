@@ -154,6 +154,7 @@ pub struct RuntimeSettings {
     pub openai_session_affinity_ttl_hours: u32,
     pub responses_max_decompressed_body_bytes: u64,
     pub smart_scheduling: SmartSchedulingConfig,
+    pub quota_reset_window_weights: ResetWindowWeights,
     pub min_codex_desktop_version: Option<String>,
     pub min_codex_cli_version: Option<String>,
     pub usage_retention_days: u32,
@@ -161,8 +162,10 @@ pub struct RuntimeSettings {
     pub audit_retention_days: u32,
     pub account_error_protection: AccountErrorProtection,
     pub account_warmup_enabled: bool,
-    pub account_warmup_schedule_time: String,
+    pub account_warmup_cron: String,
     pub account_warmup_model: Option<String>,
+    #[serde(default)]
+    pub reset_credit_on_low_weekly_quota: bool,
     pub reset_credit_lead_minutes: u32,
     pub reset_credit_max_weekly_remaining_percent: Option<u32>,
     pub request_profiles: ProviderRequestProfiles,
@@ -192,6 +195,7 @@ pub struct ReplaceRuntimeSettings {
     pub openai_session_affinity_ttl_hours: u32,
     pub responses_max_decompressed_body_bytes: u64,
     pub smart_scheduling: SmartSchedulingConfig,
+    pub quota_reset_window_weights: ResetWindowWeights,
     pub min_codex_desktop_version: Option<String>,
     pub min_codex_cli_version: Option<String>,
     pub usage_retention_days: u32,
@@ -199,8 +203,10 @@ pub struct ReplaceRuntimeSettings {
     pub audit_retention_days: u32,
     pub account_error_protection: AccountErrorProtection,
     pub account_warmup_enabled: bool,
-    pub account_warmup_schedule_time: String,
+    pub account_warmup_cron: String,
     pub account_warmup_model: Option<String>,
+    #[serde(default)]
+    pub reset_credit_on_low_weekly_quota: bool,
     pub reset_credit_lead_minutes: u32,
     pub reset_credit_max_weekly_remaining_percent: Option<u32>,
     /// 读取设置时的版本；与写入在同一事务内比较，防止覆盖并发更新
@@ -252,6 +258,15 @@ pub struct SmartSchedulingConfig {
     pub latency_weight: f64,
     pub reset_weight: f64,
     pub queue_weight: f64,
+    #[serde(default)]
+    pub reset_window_weights: ResetWindowWeights,
+}
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResetWindowWeights {
+    pub five_hour: f64,
+    pub weekly: f64,
+    pub monthly: f64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -392,6 +407,7 @@ impl From<RuntimeSettings> for ReplaceRuntimeSettings {
             openai_session_affinity_ttl_hours: settings.openai_session_affinity_ttl_hours,
             responses_max_decompressed_body_bytes: settings.responses_max_decompressed_body_bytes,
             smart_scheduling: settings.smart_scheduling,
+            quota_reset_window_weights: settings.quota_reset_window_weights,
             min_codex_desktop_version: settings.min_codex_desktop_version,
             min_codex_cli_version: settings.min_codex_cli_version,
             usage_retention_days: settings.usage_retention_days,
@@ -399,8 +415,9 @@ impl From<RuntimeSettings> for ReplaceRuntimeSettings {
             audit_retention_days: settings.audit_retention_days,
             account_error_protection: settings.account_error_protection,
             account_warmup_enabled: settings.account_warmup_enabled,
-            account_warmup_schedule_time: settings.account_warmup_schedule_time,
+            account_warmup_cron: settings.account_warmup_cron,
             account_warmup_model: settings.account_warmup_model,
+            reset_credit_on_low_weekly_quota: settings.reset_credit_on_low_weekly_quota,
             reset_credit_lead_minutes: settings.reset_credit_lead_minutes,
             reset_credit_max_weekly_remaining_percent: settings
                 .reset_credit_max_weekly_remaining_percent,

@@ -1,6 +1,7 @@
 //! 验证会话主账号偏好、严格绑定、最终请求身份与轮次关联
 
 use super::*;
+use gateway_core::engine::policy::AccountScheduleRole;
 
 #[tokio::test]
 async fn session_affinity_storage_tolerates_delays_but_rejects_expired_requests_before_sending() {
@@ -166,20 +167,6 @@ async fn cyber_policy_session_exclusion_has_actionable_non_retryable_error() {
         Some("cyber_policy")
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
-    // 其他账号仍可用于该会话时，不能误报全部账号受限
-    let available = provider
-        .clone()
-        .execute(
-            request(),
-            context("req_policy_available", CancellationToken::new()),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        available.metadata().provider_account_id().as_str(),
-        "acct_subagent_b"
-    );
-    drop(available);
     // 会话限制不能影响同一密钥的其他会话
     store
         .set_enabled(&ProviderAccountId::new("acct_subagent_b").unwrap(), false)
@@ -852,6 +839,10 @@ async fn child_queue_timeout_does_not_rebind_or_allow_provider_fallback() {
         .err()
         .expect("queue timeout");
     assert_eq!(error.kind(), ProviderErrorKind::ConcurrencyQueueTimeout);
+    assert_eq!(
+        gateway_core::error::GatewayError::from_provider(&error).client_message(),
+        "Request queue wait timed out."
+    );
     assert!(error.retry_is_prohibited());
     assert_eq!(affinity.binding_count(), 1);
     assert!(server.received_requests().await.unwrap().is_empty());
@@ -859,6 +850,7 @@ async fn child_queue_timeout_does_not_rebind_or_allow_provider_fallback() {
 
 #[derive(Debug)]
 struct SessionScheduler {
+    expected_owner: (bool, AccountScheduleRole),
     decision: gateway_core::engine::policy::AccountScheduleDecision,
 }
 impl gateway_core::engine::policy::RequestPolicyPlan for SessionScheduler {
@@ -884,12 +876,17 @@ impl gateway_core::engine::policy::RequestPolicyPlan for SessionScheduler {
             gateway_core::engine::policy::RequestPolicyFault,
         >,
     > {
-        assert!(
-            input
+        for (id, (bound, role)) in [
+            ("acct_subagent_a", self.expected_owner),
+            ("acct_subagent_b", (false, AccountScheduleRole::Ordinary)),
+        ] {
+            let candidate = input
                 .candidates()
                 .iter()
-                .any(|candidate| candidate.account_id().as_str() == "acct_subagent_b")
-        );
+                .find(|candidate| candidate.account_id().as_str() == id)
+                .unwrap();
+            assert_eq!((candidate.session_bound(), candidate.role()), (bound, role));
+        }
         let decision = self.decision.clone();
         Box::pin(async move { Ok(decision) })
     }
@@ -902,15 +899,20 @@ impl gateway_core::routing::extensions::ExtensionSetLease for SessionExtensionLe
 }
 
 #[tokio::test]
-async fn child_binding_respects_filtered_delegation_and_explicit_plugin_choices() {
+async fn scheduler_distinguishes_session_bindings_from_cache_preferences_and_keeps_native_selection()
+ {
+    use AccountScheduleRole::{FollowOnly, Ordinary, Preferred};
     use gateway_core::account::AccountAffinity;
     use gateway_core::engine::policy::RequestPolicyContext;
     use gateway_core::routing::extensions::{ExtensionSetId, ExtensionSetReference};
-    for (choice, mode) in [
-        ("delegate", AccountAffinity::Strict),
-        ("pick", AccountAffinity::Strict),
-        ("filter", AccountAffinity::Strict),
-        ("filter", AccountAffinity::Preferred),
+    for (choice, mode, expected_owner) in [
+        ("delegate", AccountAffinity::Strict, (true, FollowOnly)),
+        ("pick", AccountAffinity::Strict, (true, FollowOnly)),
+        ("filter", AccountAffinity::Strict, (true, FollowOnly)),
+        ("filter", AccountAffinity::Preferred, (true, Preferred)),
+        ("filter", AccountAffinity::Relaxed, (true, Ordinary)),
+        ("cache", AccountAffinity::Preferred, (false, Preferred)),
+        ("new", AccountAffinity::Preferred, (false, Ordinary)),
     ] {
         let store = Arc::new(MemoryAccountStore::default());
         create_account(&store, "acct_subagent_a").await;
@@ -923,11 +925,27 @@ async fn child_binding_respects_filtered_delegation_and_explicit_plugin_choices(
             server.uri(),
             leases.clone(),
         );
+        let cache_request = || {
+            let payload = ProtocolPayload::json_object(
+                "openai",
+                json!({"prompt_cache_key": "shared", "input": "hello"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+            Operation::Generate(GenerateRequest::from_protocol_payload(payload))
+        };
+        let seed = if choice == "cache" {
+            cache_request()
+        } else {
+            turn_request("root", "root-turn")
+        };
         drop(
             provider
                 .clone()
                 .execute(
-                    planned_request("openai", turn_request("root", "root-turn")),
+                    planned_request("openai", seed),
                     context("req_plugin_root", CancellationToken::new()),
                 )
                 .await
@@ -943,11 +961,12 @@ async fn child_binding_respects_filtered_delegation_and_explicit_plugin_choices(
         let key = ClientApiKeyId::new("key_openai_contract").unwrap();
         let policy = RequestPolicyContext::new(
             Arc::new(SessionScheduler {
+                expected_owner,
                 decision: match choice {
                     "pick" => gateway_core::engine::policy::AccountScheduleDecision::Pick(
                         ProviderAccountId::new("acct_subagent_b").unwrap(),
                     ),
-                    "filter" => {
+                    "filter" | "cache" | "new" => {
                         gateway_core::engine::policy::AccountScheduleDecision::DelegateFiltered(
                             BTreeSet::from([ProviderAccountId::new("acct_subagent_a").unwrap()]),
                         )
@@ -976,7 +995,15 @@ async fn child_binding_respects_filtered_delegation_and_explicit_plugin_choices(
         let mut pending = Box::pin(provider.clone().execute(
             planned_request(
                 "openai",
-                Operation::Generate(generate_with_session_context("root", Some("child"), None)),
+                match choice {
+                    "cache" => cache_request(),
+                    "new" => turn_request("separate-session", "separate-turn"),
+                    _ => Operation::Generate(generate_with_session_context(
+                        "root",
+                        Some("child"),
+                        None,
+                    )),
+                },
             ),
             attempt,
         ));
@@ -991,7 +1018,7 @@ async fn child_binding_respects_filtered_delegation_and_explicit_plugin_choices(
                 error.send_state(),
                 gateway_core::upstream::UpstreamSendState::NotSent
             );
-        } else if choice == "pick" || choice == "filter" {
+        } else if choice != "delegate" {
             let stream = timeout(Duration::from_secs(2), pending)
                 .await
                 .unwrap()
@@ -1406,26 +1433,31 @@ async fn relaxed_and_preferred_session_requests_apply_distinct_scheduling_polici
 }
 
 #[tokio::test]
-async fn preferred_child_can_claim_without_a_root_and_model_access_can_split_accounts() {
+async fn child_model_mismatch_waits_for_the_parent_or_splits_by_affinity_mode() {
     use gateway_core::account::{AccountModelAccess, AccountModelAccessMode};
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_subagent_a").await;
     let affinity = Arc::new(MemorySessionAffinity::default());
     let provider = provider_with_affinity(&store, affinity.clone());
-    let select = |thread, model: &'static str, scope| {
+    let preferred = |scope| preferred_context("req_preferred_model", scope);
+    let select = |thread, model: &'static str, attempt| {
         provider.clone().execute(
             planned_request_for_model(
                 "openai",
                 Operation::Generate(generate_with_session_context("root", Some(thread), None)),
                 model,
             ),
-            preferred_context("req_preferred_model", scope),
+            attempt,
         )
     };
     drop(
-        select("early-child", "gpt-5.4", contract_account_scope())
-            .await
-            .unwrap(),
+        select(
+            "early-child",
+            "gpt-5.4",
+            preferred(contract_account_scope()),
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(
         affinity.binding_count(),
@@ -1433,7 +1465,7 @@ async fn preferred_child_can_claim_without_a_root_and_model_access_can_split_acc
         "the first session request claims the shared primary"
     );
     drop(
-        select("root", "gpt-5.4", contract_account_scope())
+        select("root", "gpt-5.4", preferred(contract_account_scope()))
             .await
             .unwrap(),
     );
@@ -1463,7 +1495,44 @@ async fn preferred_child_can_claim_without_a_root_and_model_access_can_split_acc
         Arc::new(directory),
         ClientRoutingScope::all_accounts(),
     ));
-    let child = select("model-child", "gpt-5.5", scope.clone())
+    for (scope, reason) in [
+        (
+            scope.clone(),
+            "The parent session's account does not allow the requested model.",
+        ),
+        (
+            Arc::new(scope.excluding_account(ProviderAccountId::new("acct_subagent_a").unwrap())),
+            "The parent session's account cannot serve this request.",
+        ),
+    ] {
+        let strict = context_with_affinity_policy(
+            "req_strict_model",
+            scope,
+            account_policy().with_queue(gateway_core::concurrency::ConcurrencyQueuePolicy {
+                max_waiting: 1,
+                timeout: Duration::from_millis(120),
+            }),
+        );
+        let error = select("model-child", "gpt-5.5", strict)
+            .await
+            .err()
+            .expect("strict child waits for the parent to switch accounts");
+        assert_eq!(error.kind(), ProviderErrorKind::ConcurrencyQueueTimeout);
+        assert!(error.retry_is_prohibited());
+        let gateway = gateway_core::error::GatewayError::from_provider(&error);
+        assert_eq!(
+            gateway.client_message(),
+            format!("{reason} Timed out waiting for the session to switch accounts.")
+        );
+        assert!(
+            error
+                .error_details()
+                .unwrap()
+                .contains(gateway.client_message())
+        );
+    }
+
+    let child = select("model-child", "gpt-5.5", preferred(scope.clone()))
         .await
         .unwrap();
     assert_eq!(
@@ -1472,7 +1541,7 @@ async fn preferred_child_can_claim_without_a_root_and_model_access_can_split_acc
     );
     drop(child);
     assert_eq!(
-        select("root", "gpt-5.4", scope)
+        select("root", "gpt-5.4", preferred(scope))
             .await
             .unwrap()
             .metadata()
@@ -1659,6 +1728,7 @@ async fn preferred_final_thread_rewrite_within_the_session_preserves_the_primary
             in_flight: 100,
             last_started_at: None,
             quota_reset_at: None,
+            quota_reset_windows: None,
             quota_remaining_rank: None,
             cooldown: None,
             failure_rate_basis_points: None,
@@ -1888,6 +1958,7 @@ async fn preferred_primary_migration_distinguishes_temporary_and_persistent_unav
                         in_flight: 2,
                         last_started_at: None,
                         quota_reset_at: None,
+                        quota_reset_windows: None,
                         quota_remaining_rank: None,
                         cooldown: None,
                         failure_rate_basis_points: None,
@@ -2013,6 +2084,7 @@ async fn preferred_spillover_stays_stable_and_concurrent_migration_claims_one_pr
             in_flight: 100,
             last_started_at: None,
             quota_reset_at: None,
+            quota_reset_windows: None,
             quota_remaining_rank: None,
             cooldown: None,
             failure_rate_basis_points: None,

@@ -4,7 +4,7 @@ import type { UsageRecordDetail } from '@/api'
 import { ZButton, ZDialog } from '@codex-proxy/ui'
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { usageErrorSummary } from '@/components/usage/shared/errors'
+import { usageDisplayOutcome, usageSendStateText } from '@/components/usage/shared/errors'
 import { usageAccountText, usageModelDisplay, usageTransportType } from '@/components/usage/shared/presenter'
 import { formatDuration } from '@/utils/format'
 import { attemptOutcomeClass, attemptOutcomeText, visibleResponseText } from '../utils/detail'
@@ -12,6 +12,7 @@ import DiagnosticsDownloadButton from './DiagnosticsDownloadButton.vue'
 import UsageDetailCodePanel from './UsageDetailCodePanel.vue'
 import UsageDetailFieldGrid from './UsageDetailFieldGrid.vue'
 import UsageDetailState from './UsageDetailState.vue'
+import UsageErrorDiagnosis from './UsageErrorDiagnosis.vue'
 import UsageStatusCodeBadge from './UsageStatusCodeBadge.vue'
 
 const props = defineProps<{ record: UsageRecordDetail | null, loading?: boolean, error?: string }>()
@@ -25,35 +26,6 @@ const open = defineModel<boolean>({ default: false })
 const panelClass = 'min-w-0 rounded-z-card bg-z-fill-quaternary px-4 py-3.5'
 const panelTitleClass = 'm-0 text-z-sm leading-none font-heavy text-z-text-secondary'
 
-const errorMessage = computed(() => {
-  const message = props.record?.message.trim()
-  return message && message !== props.record?.logicalOutcome
-    ? message
-    : t('usage.error.noDetails')
-})
-const errorSummary = computed(() => props.record
-  ? usageErrorSummary(props.record)
-  : null)
-const upstreamMessage = computed(() => props.record?.upstreamError?.message)
-const errorItems = computed(() => [
-  { label: 'Code', value: props.record?.upstreamError?.code ?? props.record?.errorCode },
-  { label: 'Type', value: props.record?.upstreamError?.errorType },
-  { label: 'Param', value: props.record?.upstreamError?.param },
-  {
-    label: t('usage.error.websocketCloseCode'),
-    value: props.record?.websocketCloseCode,
-  },
-  {
-    label: t('usage.error.lastEventType'),
-    value: props.record?.upstreamError?.lastEventType,
-  },
-  {
-    label: t('usage.error.retryAfter'),
-    value: props.record?.retryAfterMs == null
-      ? null
-      : formatDuration(props.record.retryAfterMs),
-  },
-].filter(item => item.value != null && item.value !== '').map(item => ({ ...item, mono: true, wrap: true })))
 const responseText = computed(() => props.record
   ? visibleResponseText(props.record)
   : '')
@@ -68,6 +40,7 @@ const contextItems = computed(() => [
       : null,
     mono: true,
     fullWidth: true,
+    wrap: true,
   },
   {
     label: t('usage.fields.time'),
@@ -114,20 +87,11 @@ const contextItems = computed(() => [
 ])
 const identifierItems = computed(() => [
   {
-    label: t('usage.error.clientStatusCode'),
-    value: props.record?.clientStatusCode,
-    mono: true,
-  },
-  {
-    label: t('usage.error.upstreamStatusCode'),
-    value: props.record?.upstreamStatusCode,
-    mono: true,
-  },
-  {
     label: t('usage.error.requestId'),
     value: props.record?.requestId,
     mono: true,
     fullWidth: true,
+    wrap: true,
   },
   ...(props.record?.upstreamRequestId
     ? [
@@ -136,6 +100,7 @@ const identifierItems = computed(() => [
           value: props.record.upstreamRequestId,
           mono: true,
           fullWidth: true,
+          wrap: true,
         },
       ]
     : []),
@@ -144,18 +109,20 @@ const identifierItems = computed(() => [
     value: props.record?.responseId,
     mono: true,
     fullWidth: true,
+    wrap: true,
   },
   {
     label: t('usage.error.clientKeyId'),
     value: props.record?.clientApiKeyId,
     mono: true,
     fullWidth: true,
+    wrap: true,
   },
 ])
 const attempts = computed(() => (props.record?.attempts ?? []).map(attempt => ({
   id: attempt.id,
   index: attempt.attemptIndex,
-  outcome: attempt.outcome,
+  outcome: usageDisplayOutcome(attempt.outcome, attempt.providerErrorCode, attempt.failureClass),
   statusCode: attempt.statusCode,
   items: [
     {
@@ -195,8 +162,15 @@ const attempts = computed(() => (props.record?.attempts ?? []).map(attempt => ({
     },
     {
       label: t('usage.error.sendStatus'),
-      value: attempt.sendState,
-      mono: true,
+      value: usageSendStateText(attempt.sendState),
+    },
+    {
+      label: t('usage.error.clientResponse'),
+      value: attempt.downstreamCommitted == null
+        ? t('usage.error.responseNotRecorded')
+        : attempt.downstreamCommitted
+          ? t('usage.error.responseStarted')
+          : t('usage.error.responseNotStarted'),
     },
   ],
 })))
@@ -206,44 +180,7 @@ const attempts = computed(() => (props.record?.attempts ?? []).map(attempt => ({
   <ZDialog v-model="open" :title="t('usage.error.errorDetails')" :description="t('usage.error.description')" type="danger" width="64rem">
     <UsageDetailState v-if="loading || error" variant="error" :loading="!!loading" :error="error" @retry="emit('retry')" />
     <div v-else-if="record" class="grid min-w-0 gap-3">
-      <section class="min-w-0 rounded-z-card bg-z-error-container px-4 py-3.5 text-z-error-on-container">
-        <div class="flex flex-wrap items-center gap-3">
-          <h3 class="m-0 text-z-sm leading-none font-heavy">
-            {{ record.logicalOutcome === 'incomplete' ? t('usage.error.responseIsNotComplete') : t('usage.error.requestFailed') }}
-          </h3>
-          <span v-if="record.recovered" class="rounded-z-sm bg-z-success-container px-2 py-1 text-z-xs font-emphasis text-z-success-on-container">
-            {{ t('usage.error.recovered') }}
-          </span>
-        </div>
-        <p v-if="errorSummary" class="mt-2 mb-0 text-z-sm leading-relaxed">
-          {{ errorSummary }}
-        </p>
-        <UsageDetailFieldGrid v-if="errorItems.length" :items="errorItems" />
-        <template v-if="upstreamMessage">
-          <p class="mt-3 mb-1 text-z-xs text-z-text-secondary">
-            Message
-          </p>
-          <p class="m-0 wrap-anywhere whitespace-pre-wrap font-mono text-z-sm leading-relaxed" translate="no">
-            {{ upstreamMessage }}
-          </p>
-        </template>
-        <template v-if="record.upstreamError?.closeReason">
-          <p class="mt-3 mb-1 text-z-xs text-z-text-secondary">
-            {{ t('usage.error.closeReason') }}
-          </p>
-          <p class="m-0 wrap-anywhere whitespace-pre-wrap font-mono text-z-sm leading-relaxed" translate="no">
-            {{ record.upstreamError.closeReason }}
-          </p>
-        </template>
-        <template v-if="!upstreamMessage || upstreamMessage !== errorMessage">
-          <p class="mt-3 mb-1 text-z-xs text-z-text-secondary">
-            {{ t('usage.error.gatewayMessage') }}
-          </p>
-          <p class="m-0 wrap-anywhere whitespace-pre-wrap font-mono text-z-sm leading-relaxed" translate="no">
-            {{ errorMessage }}
-          </p>
-        </template>
-      </section>
+      <UsageErrorDiagnosis :record="record" />
 
       <section class="grid min-w-0 gap-3 lg:grid-cols-2">
         <section :class="panelClass">
@@ -264,15 +201,18 @@ const attempts = computed(() => (props.record?.attempts ?? []).map(attempt => ({
         <h3 :class="panelTitleClass">
           {{ t('usage.error.attempts') }}
         </h3>
-        <p v-if="!record.attemptsComplete" class="mt-3 mb-0 text-z-sm text-z-text-tertiary">
+        <p v-if="!record.attemptsComplete" class="mt-3 mb-0 text-z-sm text-z-text-secondary">
           {{ t('usage.error.attemptRecordMayBeIncomplete') }}
         </p>
-        <ol v-if="attempts.length" class="mt-3 mb-0 grid list-none gap-4 p-0 lg:grid-cols-2">
+        <p v-if="!attempts.length" class="mt-3 mb-0 text-z-sm text-z-text-secondary">
+          {{ t('usage.error.noAttempts') }}
+        </p>
+        <ol v-else class="mt-3 mb-0 grid list-none gap-4 p-0 lg:grid-cols-2">
           <li v-for="attempt in attempts" :key="attempt.id" class="min-w-0">
             <div class="flex items-center gap-3 text-z-sm font-bold">
               <span>{{ t('usage.error.attempt', { index: attempt.index }) }}</span>
               <span :class="attemptOutcomeClass(attempt.outcome)">{{ attemptOutcomeText(attempt.outcome) }}</span>
-              <UsageStatusCodeBadge :status-code="attempt.statusCode" />
+              <UsageStatusCodeBadge v-if="attempt.statusCode != null" :status-code="attempt.statusCode" />
             </div>
             <UsageDetailFieldGrid :items="attempt.items" />
           </li>

@@ -759,6 +759,7 @@ impl AccountsService for DefaultAccountsService {
             self.accounts
                 .batch_update_accounts(
                     BatchUpdateAccounts {
+                        quota_settings: None,
                         auto_use_quota_credits: None,
                         account_ids: vec![account_id.to_string()],
                         enabled: Some(true),
@@ -768,6 +769,7 @@ impl AccountsService for DefaultAccountsService {
                         group_ids: None,
                         outbound_proxy: None,
                     },
+                    Default::default(),
                     context,
                 )
                 .await
@@ -841,8 +843,58 @@ impl AccountsService for DefaultAccountsService {
                 Vec<ProviderAccountId>,
             ),
         >::new();
+        let mut pauses = BTreeMap::new();
         for account_id in &account_ids {
-            let (item, provider) = self.provider_for_account(account_id).await?;
+            let (mut item, provider) = self.provider_for_account(account_id).await?;
+            if let Some(settings) = &command.quota_settings {
+                if !provider
+                    .account_capabilities(account_id, &item.account.authentication_kind)
+                    .quota_settings_supported
+                {
+                    return Err(AdminError::invalid("该账号不支持额度桶设置"));
+                }
+                let previous_settings = item.account.quota_settings.clone();
+                let settings = settings.clone();
+                let mut observed_at = None;
+                let mut paused = false;
+                if !settings.is_empty() {
+                    item.account.quota_settings = settings.clone();
+                    let quota = provider
+                        .read_quotas(&[ProviderQuotaReadRequest {
+                            account: &item.account,
+                            rolling_usage: None,
+                        }])
+                        .await
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| AdminError::invalid("缺少账号额度观测结果"))?
+                        .map_err(|error| map_provider_error(error, "provider quota"))?;
+                    for key in settings.keys() {
+                        let window = quota.windows.iter().find(|window| window.key == key);
+                        if window.is_none() && !previous_settings.contains(key) {
+                            return Err(AdminError::invalid("只能设置已观测的额度桶"));
+                        }
+                        if window.is_some_and(|window| {
+                            window.local_usage_attribution
+                                != QuotaLocalUsageAttribution::AccountWide
+                        }) {
+                            return Err(AdminError::invalid("只能设置通用额度桶"));
+                        }
+                    }
+                    observed_at = quota.observed_at;
+                    paused = !quota.paused_windows.is_empty();
+                }
+                pauses.insert(
+                    item.account.id.clone(),
+                    crate::model::accounts::PreparedQuotaPause {
+                        settings,
+                        previous_settings,
+                        revision: item.account.credential_revision,
+                        observed_at,
+                        paused,
+                    },
+                );
+            }
             if command.auto_use_quota_credits.is_some()
                 && !provider
                     .account_capabilities(account_id, &item.account.authentication_kind)
@@ -864,7 +916,7 @@ impl AccountsService for DefaultAccountsService {
         let enabled = command.enabled;
         let result = self
             .accounts
-            .batch_update_accounts(command, context)
+            .batch_update_accounts(command, pauses, context)
             .await
             .map_err(|error| map_store_error(error, "provider accounts"))?;
         for (provider, provider_ids, _) in providers.values() {
@@ -1214,6 +1266,7 @@ impl AccountsService for DefaultAccountsService {
                     vec![AccountConnectionTestEvent::Failed {
                         source: error.source(),
                         gateway_error_code: error.kind(),
+                        proxy_hint: error.proxy_hint(),
                         send_state: error.send_state(),
                         message,
                         provider_error_code: error.client_error_code().map(ToOwned::to_owned),

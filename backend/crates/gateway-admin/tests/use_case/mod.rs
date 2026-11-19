@@ -546,6 +546,17 @@ impl AccountStore for UnavailableStore {
         Err(unavailable("account quota window usage"))
     }
 
+    async fn quota_documents(
+        &self,
+        _: &gateway_core::account::ProviderAccountId,
+        _: &gateway_core::routing::ProviderKind,
+        _: chrono::DateTime<chrono::Utc>,
+        _: gateway_admin::model::observability::TimeRange,
+        _: Option<&gateway_admin::model::quota_history::QuotaHistoryCursor>,
+    ) -> AdminStoreResult<gateway_admin::model::quota_history::QuotaDocumentPage> {
+        unreachable!("测试不读取历史额度文档")
+    }
+
     async fn load_quota_forecast_history(
         &self,
         _: &AccountUsageWindowQuery,
@@ -644,6 +655,7 @@ impl AccountStore for UnavailableStore {
     async fn batch_update_accounts(
         &self,
         _: BatchUpdateAccounts,
+        _: gateway_admin::model::accounts::PreparedQuotaPauses,
         _: &MutationContext,
     ) -> AdminStoreResult<AccountsUpdateResult> {
         Err(unavailable("account batch update"))
@@ -707,6 +719,32 @@ impl AccountRuntimeStore for UnavailableStore {
 
 #[async_trait]
 impl ClientKeyStore for UnavailableStore {
+    async fn client_key_budget_window(
+        &self,
+        _: &gateway_core::policy::ClientApiKeyId,
+        _: gateway_admin::model::client_keys::ClientKeyBudgetWindowPeriod,
+    ) -> gateway_admin::ports::store::AdminStoreResult<
+        gateway_admin::model::client_keys::ClientKeyBudgetWindow,
+    > {
+        Err(gateway_admin::ports::store::AdminStoreError::new(
+            gateway_admin::ports::store::AdminStoreErrorKind::Unavailable,
+            "client key",
+            "unused budget window",
+        ))
+    }
+    async fn set_client_key_budget_window(
+        &self,
+        _: gateway_admin::model::client_keys::SetClientKeyBudgetWindow,
+        _: gateway_admin::model::client_keys::ClientKeyBudgetMutationOrigin,
+        _: &MutationContext,
+    ) -> gateway_admin::ports::store::AdminStoreResult<u64> {
+        Err(gateway_admin::ports::store::AdminStoreError::new(
+            gateway_admin::ports::store::AdminStoreErrorKind::Unavailable,
+            "client key",
+            "unused budget window",
+        ))
+    }
+
     async fn update_client_key_budget_limits(
         &self,
         _: gateway_admin::model::client_keys::UpdateClientKeyBudgetLimits,

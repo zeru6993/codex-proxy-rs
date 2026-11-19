@@ -877,10 +877,14 @@ fn compiler_accepts_unlimited_default_account_concurrency() {
 
 #[test]
 fn compiled_plans_keep_their_scheduling_config_after_a_new_snapshot_is_built() {
-    use gateway_core::account::SmartSchedulingConfig;
+    use gateway_core::account::{ResetWindowWeights, SmartSchedulingConfig};
     let configs = [
         SmartSchedulingConfig::default(),
         SmartSchedulingConfig::new([0.0, 2.0, 1.0, 0.5, 1.2, 2.3]).unwrap(),
+    ];
+    let windows = [
+        ResetWindowWeights::default(),
+        ResetWindowWeights::new([0.0, 1.5, 0.0]).unwrap(),
     ];
     let mut plans = Vec::new();
     for (index, config) in configs.into_iter().enumerate() {
@@ -889,6 +893,7 @@ fn compiled_plans_keep_their_scheduling_config_after_a_new_snapshot_is_built() {
             revision(index as u64 + 1),
             SettingsValues::new(3, "smart", BTreeMap::new(), None, None)
                 .with_smart_scheduling(config)
+                .with_quota_reset_window_weights(windows[index])
                 .with_openai_guardian_reserved_concurrency(index as u32),
             vec![],
             vec![],
@@ -921,6 +926,10 @@ fn compiled_plans_keep_their_scheduling_config_after_a_new_snapshot_is_built() {
             index as u32
         );
         assert_eq!(plan.account_selection_policy().smart_scheduling(), config);
+        assert_eq!(
+            plan.account_selection_policy().quota_reset_window_weights(),
+            windows[index]
+        );
     }
 }
 
@@ -1484,7 +1493,7 @@ fn facts(config_revision: u64, observed_current_revision: u64) -> SnapshotFacts 
 }
 
 #[test]
-fn peer_policy_compilation_keeps_only_explicitly_shared_direct_accounts() {
+fn peer_policy_compilation_keeps_all_accounts_in_explicit_enabled_groups() {
     use gateway_core::{
         account::ProviderAccountId, policy::ClientPeerSharing, routing::AccountGroupId,
     };
@@ -1561,7 +1570,7 @@ fn peer_policy_compilation_keeps_only_explicitly_shared_direct_accounts() {
         .unwrap();
         let scope = snapshot.client_policies().next().unwrap().account_scope();
         assert_eq!(scope.allows(&direct), expected);
-        assert!(!scope.allows(&proxy));
+        assert_eq!(scope.allows(&proxy), expected);
         assert_eq!(scope.provider_kinds().is_empty(), !expected);
     }
 }

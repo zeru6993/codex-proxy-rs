@@ -19,10 +19,12 @@ crc32fast = "1.5.0"
 futures = "0.3.32"
 flate2 = "1.1.9"
 gateway-admin = { path = "../../gateway-admin" }
+gateway-egress = { path = "../../gateway-egress" }
 gateway-core = { path = "../../gateway-core" }
 gateway-protocol = { path = "../../gateway-protocol" }
 getrandom = "0.4.3"
 hex = "0.4.3"
+lru = "0.19.0"
 # TLS 依赖以官方 Core 锁文件为基线，安全补丁经握手特征核验后精确固定
 # 包含用于约束传递依赖的直接声明
 # hyper-util 固定到包含 SOCKS IPv6 修复的正式版
@@ -51,15 +53,16 @@ sha2 = "0.11.0"
 subtle = "2.6.1"
 tar = { version = "0.4.46", default-features = false }
 thiserror = "2.0.18"
+tiktoken-rs = "=0.12.1"
 tokio = { version = "=1.53.3", default-features = false, features = ["fs", "macros", "rt", "sync", "time"] }
 tokio-rustls = { version = "=0.26.4", default-features = false }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 tower-service = "0.3.3"
 tower-layer = "0.3.3"
-# 官方 Codex WebSocket 需要上游尚未发布的 proxy 与 permessage-deflate 实现，固定到已审计提交。
-tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", features = ["proxy", "rustls-tls-native-roots"] }
+# 官方 fork 支持代理连接和分帧消息的 permessage-deflate，两个提交须配套
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "7447c427513cfe685f236e1ac0513c4ea3dd9c0b", features = ["proxy", "rustls-tls-native-roots"] }
 tracing = "0.1.44"
-tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", features = ["deflate", "proxy"] }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "bc589d684755a8c02da0fc7e58d0861cbfc306f1", features = ["deflate", "proxy"] }
 url = "2.5.8"
 uuid = { version = "1.23.3", features = ["v4", "v7"] }
 # 静态链接 XZ 解码器，不要求部署环境安装 liblzma。
@@ -70,14 +73,14 @@ zstd = "=0.14.3"
 zip = { version = "9.0.4", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-openssl = "=0.10.78"
-openssl-sys = { version = "=0.9.114", features = ["vendored"] }
+openssl = "=0.10.82"
+openssl-sys = { version = "=0.9.118", features = ["vendored"] }
 
 [dev-dependencies]
 gateway-host = { path = "../../gateway-host" }
 allocation-counter = "0.8.1"
 tempfile = "3.27.0"
-tokio = { version = "1.53.3", default-features = false, features = ["rt-multi-thread", "test-util"] }
+tokio = { version = "1.53.3", default-features = false, features = ["process", "rt-multi-thread", "test-util"] }
 tracing-subscriber = { version = "0.3.23", features = ["json"] }
 wiremock = "0.6.5"
 

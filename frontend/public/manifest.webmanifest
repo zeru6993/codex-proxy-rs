@@ -1,0 +1,15 @@
+{
+  "name": "Codex Proxy RS",
+  "short_name": "Codex Proxy",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay"],
+  "icons": [
+    {
+      "src": "./favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

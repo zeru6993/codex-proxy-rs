@@ -69,7 +69,7 @@ const COMPLETED_SESSION_SSE: &str = concat!(
 );
 
 #[tokio::test]
-async fn plan_display_should_distinguish_pro_tiers_and_preserve_other_official_names() {
+async fn plan_display_uses_pro_short_names_and_codex_status_labels_for_other_known_plans() {
     let config = valid_config();
     let bundle = provider_openai::initialize(
         config.config.clone(),
@@ -86,25 +86,25 @@ async fn plan_display_should_distinguish_pro_tiers_and_preserve_other_official_n
         ("free", "Free"),
         ("go", "Go"),
         ("plus", "Plus"),
-        ("team", "Team"),
-        ("self_serve_business_prolite", "Self Serve Business ProLite"),
-        (
-            "self_serve_business_usage_based",
-            "Self Serve Business Usage Based",
-        ),
-        ("business", "Business"),
+        ("team", "Business"),
+        ("self_serve_business_prolite", "Business Premium"),
+        ("self_serve_business_usage_based", "Business"),
+        ("business", "Enterprise"),
         ("ent26", "Enterprise"),
         ("enterprise", "Enterprise"),
         ("hc", "Enterprise"),
         ("enterprise_cbp_automation", "Enterprise (Automation)"),
-        ("enterprise_cbp_usage_based", "Enterprise CBP Usage Based"),
+        ("enterprise_cbp_usage_based", "Enterprise"),
         ("edu", "Edu"),
         ("education", "Edu"),
         ("edu_plus", "Edu Plus"),
         ("edu_pro", "Edu Pro"),
-        ("future_plan", "future_plan"),
+        ("sci", "Academic Researchers"),
+        ("sci_plus", "Academic Researchers Plus"),
+        ("SCI_PLUS", "Academic Researchers Plus"),
+        ("Future_Plan", "Future_Plan"),
     ] {
-        assert_eq!(admin.plan_type_display(raw), display);
+        assert_eq!(admin.plan_type_display(raw), display, "{raw}");
     }
 }
 
@@ -352,6 +352,33 @@ async fn quota_forecast_observation_reuses_protocol_parser_and_keeps_window_iden
         .unwrap()
         .clone(),
     ));
+    let history = provider.quota_history_parser().unwrap();
+    let short = history(&document, "codex:18000s").unwrap();
+    assert_eq!(short.used_percent, 4.0);
+    assert_eq!(short.reset_at.unwrap().timestamp(), 1_789_218_647);
+    assert!(history(&document, "other:18000s").is_none());
+    let named = ProviderDocument::new(OpaqueProviderData::new(
+        json!({
+            "rateLimitHeaders": [
+                ["x-codex-primary-used-percent","23"],["x-codex-primary-window-minutes","1"],
+                ["x-feature-primary-used-percent","23"],["x-feature-primary-window-minutes","1"],
+                ["x-feature-secondary-used-percent","56"],["x-feature-secondary-window-minutes","1"]
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    ));
+    assert!(history(&named, "codex:60s").is_none());
+    assert!(history(&named, "feature:60s").is_none());
+    let primary = history(&named, "feature:60s:primary_window").unwrap();
+    assert_eq!((primary.used_percent, primary.reset_at), (23.0, None));
+    assert_eq!(
+        history(&named, "feature:60s:secondary_window")
+            .unwrap()
+            .used_percent,
+        56.0
+    );
     let observed = provider
         .quota_forecast_observation(&document, &window)
         .unwrap();
@@ -496,13 +523,18 @@ async fn copying_builtin_prices_keeps_cache_read_and_write_fallback_costs() {
     for model in [
         "gpt-4",
         "gpt-4o",
+        "gpt-6.2-astra",
+        "gpt-6.2-sol",
         "gpt-6-astra",
         "gpt-6.1-sol",
         "gpt-6.1-terra",
         "gpt-6-sol",
         "gpt-6-luna",
     ] {
-        let ultrafast_supported = matches!(model, "gpt-6-astra" | "gpt-6.1-sol");
+        let ultrafast_supported = matches!(
+            model,
+            "gpt-6.2-astra" | "gpt-6.2-sol" | "gpt-6-astra" | "gpt-6.1-sol"
+        );
         for band in ["ultrafast", "long_ultrafast"] {
             assert_eq!(prices[model].bands.contains_key(band), ultrafast_supported);
         }
@@ -709,7 +741,7 @@ async fn reset_credit_explicit_http_rejection_should_preserve_the_raw_body() {
 }
 
 #[tokio::test]
-async fn openai_core_provider_projects_codex_request_observation_without_routing_side_effects() {
+async fn openai_core_provider_projects_private_request_observation_without_execution() {
     let config = valid_config();
     let bundle = provider_openai::initialize(
         config.config.clone(),
@@ -723,14 +755,11 @@ async fn openai_core_provider_projects_codex_request_observation_without_routing
         Map::from_iter([
             ("model".to_owned(), json!("gpt-5.4")),
             ("input".to_owned(), json!("summarize")),
-            ("reasoning".to_owned(), json!({"effort": "high"})),
+            ("session_id".to_owned(), json!("observation-session")),
+            ("previous_response_id".to_owned(), json!("resp_previous")),
         ]),
     )
-    .expect("OpenAI payload")
-    .with_context(Map::from_iter([(
-        "turn_metadata".to_owned(),
-        Value::String(r#"{"request_kind":"compaction","subagent_kind":"review"}"#.to_owned()),
-    )]));
+    .expect("OpenAI payload");
     let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
 
     let client_key_id = ClientApiKeyId::new("key_openai_admin_observation").expect("client key");
@@ -738,11 +767,9 @@ async fn openai_core_provider_projects_codex_request_observation_without_routing
         .core_provider()
         .request_observation(&operation, &client_key_id);
 
-    assert_eq!(observation.request_kind.as_deref(), Some("compaction"));
-    assert_eq!(observation.subagent_kind.as_deref(), Some("review"));
-    // Codex 当前只在特定多代理预设组合下给出 reasoning_preset；普通 high 保持空值
-    assert_eq!(observation.reasoning_preset, None);
-    assert!(observation.compact);
+    assert!(observation.continuation.requested);
+    assert!(observation.continuation.previous_response_id_hash.is_some());
+    assert!(observation.continuation.affinity_hash.is_some());
 }
 
 #[tokio::test]
@@ -1101,6 +1128,7 @@ async fn openai_admin_batch_quota_isolates_stale_and_invalid_observations() {
             };
             store
                 .compare_and_swap_quota(QuotaObservation {
+                    quota_pause: None,
                     expected_connection: None,
                     account_id: account.id().clone(),
                     expected_revision: account.revision(),
@@ -1212,7 +1240,13 @@ async fn openai_admin_provider_projects_cached_quota_models_and_canonical_export
     let record = account_record(&account);
     let config = valid_config();
     let catalog_cache = Arc::new(TestCatalogCache::default());
-    catalog_cache.seed("plan:pro", ["gpt-5.4"]);
+    catalog_cache.seed(
+        provider_openai::credential::CodexCatalogScope::for_account(&account)
+            .cache_scope()
+            .unwrap()
+            .as_str(),
+        ["gpt-5.4"],
+    );
     let bundle = provider_openai::initialize(
         config.config.clone(),
         provider_ports_with_catalog(
@@ -1445,6 +1479,7 @@ async fn openai_admin_projects_free_plan_from_cached_quota_when_account_claims_o
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            quota_pause: None,
             expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
@@ -1561,6 +1596,7 @@ async fn openai_admin_provider_projects_official_codex_quota_and_independent_buc
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            quota_pause: None,
             expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
@@ -1664,6 +1700,7 @@ async fn openai_admin_keeps_confirmed_exhaustion_separate_from_raw_usage_display
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            quota_pause: None,
             expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
@@ -1776,6 +1813,7 @@ async fn openai_admin_preserves_expired_window_usage_and_exhaustion_attribution(
         };
         store
             .compare_and_swap_quota(QuotaObservation {
+                quota_pause: None,
                 expected_connection: None,
                 plan_type: None,
                 account_id: account.id().clone(),
@@ -2178,6 +2216,8 @@ fn provider_ports_with_catalog(
 fn account_record(account: &ProviderAccount) -> AccountRecord {
     let now = Utc::now();
     AccountRecord {
+        quota_paused: false,
+        quota_settings: Default::default(),
         auto_use_quota_credits: false,
         outbound_proxy_id: None,
         outbound_proxy_enabled: true,
@@ -3046,7 +3086,8 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         .unwrap()
         .unwrap();
     let configuration = configuration.expose_to_provider().expose_to_provider();
-    assert_eq!(configuration.len(), 2);
+    assert_eq!(configuration.len(), 3);
+    assert_eq!(configuration.get("protocol"), Some(&json!("responses")));
     assert_eq!(
         configuration.get("base_url"),
         Some(&json!("https://first.example/v1"))

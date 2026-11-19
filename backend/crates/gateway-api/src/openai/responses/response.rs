@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use gateway_core::event::{GatewayEvent, ProtocolWireEvent, ProviderEvent};
+use gateway_protocol::openai::OPENAI_PROTOCOL;
 use gateway_protocol::openai::sse::{
     encode_sse_event_with_metadata, response_failed_sse_data_from_error_event,
 };
@@ -11,8 +12,6 @@ use serde_json::Value;
 
 use super::error::ResponseEncodeError;
 use crate::client_error::capacity_error_for_client;
-
-const OPENAI_PROTOCOL: &str = "openai";
 
 /// OpenAI Responses wire 的转发器
 ///
@@ -187,7 +186,9 @@ impl OpenAiResponsesEncoder {
 }
 
 /// 仅在非流式出口聚合同一响应的完成项，不让流式转发常驻保存输出内容
-pub(super) fn collect_response(events: &[ProviderEvent]) -> Result<Value, ResponseEncodeError> {
+pub(in crate::openai) fn collect_response(
+    events: &[ProviderEvent],
+) -> Result<Value, ResponseEncodeError> {
     let mut encoder = OpenAiResponsesEncoder::new();
     let mut response_id = None;
     let mut items = BTreeMap::new();

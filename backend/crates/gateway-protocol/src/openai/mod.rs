@@ -1,5 +1,8 @@
 //! 共享的 OpenAI 线协议类型、解析与编码入口
 
+/// OpenAI 线协议载荷与事件的协议标识
+pub const OPENAI_PROTOCOL: &str = "openai";
+
 /// Codex Responses Lite 的 HTTP 请求头
 pub const X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER: &str =
     "x-openai-internal-codex-responses-lite";
@@ -18,9 +21,10 @@ mod headers;
 pub mod sse;
 
 pub use codex::{
-    CodexResponsesRequestSemantics, codex_account_session_id, codex_account_thread_id,
-    codex_responses_request_semantics, codex_responses_request_semantics_with_turn_metadata,
-    codex_session_id, codex_thread_id, codex_turn_id, turn_metadata_session_id,
+    CodexResponsesRequestSemantics, WEBSOCKET_FRAME_CONTEXT_KEY, codex_account_session_id,
+    codex_account_thread_id, codex_responses_request_semantics,
+    codex_responses_request_semantics_with_turn_metadata, codex_session_id, codex_thread_id,
+    codex_turn_id, context_turn_metadata, observed_turn_metadata, turn_metadata_session_id,
     turn_metadata_thread_id, turn_metadata_turn_id,
 };
 pub use headers::{

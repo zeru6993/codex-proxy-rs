@@ -16,6 +16,7 @@ pub(super) const WORKSPACE_MEMBERS: &[&str] = &[
     "crates/gateway-admin",
     "crates/gateway-api",
     "crates/gateway-core",
+    "crates/gateway-egress",
     "crates/gateway-host",
     "crates/gateway-plugin/runtime",
     "crates/gateway-plugin/sdk",
@@ -80,6 +81,7 @@ fn core_value_owners_do_not_depend_on_execution_or_routing() {
             "account/selection.rs" => Some(&["account", "concurrency", "identity", "validation"]),
             "concurrency.rs" => Some(&["error"]),
             "account/store.rs" => Some(&["account", "error", "identity", "validation"]),
+            "account/proxy.rs" => Some(&["upstream"]),
             path if path.starts_with("policy/") => {
                 Some(&["account", "identity", "policy", "validation"])
             }
@@ -447,6 +449,7 @@ const PACKAGE_TO_MEMBER: &[(&str, &str)] = &[
     ("gateway-admin", "crates/gateway-admin"),
     ("gateway-api", "crates/gateway-api"),
     ("gateway-core", "crates/gateway-core"),
+    ("gateway-egress", "crates/gateway-egress"),
     ("gateway-host", "crates/gateway-host"),
     ("gateway-plugin-runtime", "crates/gateway-plugin/runtime"),
     ("gateway-plugin-sdk", "crates/gateway-plugin/sdk"),
@@ -509,8 +512,11 @@ const ALLOWED_INTERNAL_EDGES: &[(&str, &str)] = &[
     ("gateway-api", "gateway-admin"),
     ("gateway-api", "gateway-core"),
     ("gateway-api", "gateway-protocol"),
+    ("gateway-core", "gateway-protocol"),
+    ("gateway-egress", "gateway-core"),
     ("gateway-host", "gateway-admin"),
     ("gateway-host", "gateway-core"),
+    ("gateway-host", "gateway-egress"),
     ("gateway-host", "gateway-protocol"),
     ("gateway-plugin-runtime", "gateway-host"),
     ("gateway-plugin-runtime", "gateway-core"),
@@ -521,9 +527,11 @@ const ALLOWED_INTERNAL_EDGES: &[(&str, &str)] = &[
     ("gateway-store", "gateway-core"),
     ("provider-openai", "gateway-admin"),
     ("provider-openai", "gateway-core"),
+    ("provider-openai", "gateway-egress"),
     ("provider-openai", "gateway-protocol"),
     ("provider-xai", "gateway-admin"),
     ("provider-xai", "gateway-core"),
+    ("provider-xai", "gateway-egress"),
     ("provider-xai", "gateway-protocol"),
 ];
 

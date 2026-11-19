@@ -97,6 +97,36 @@ fn flex_capacity_rejection_should_be_terminal_even_before_payload_send() {
 }
 
 #[test]
+fn security_rejections_do_not_grant_replay() {
+    for (status, body, category) in [
+        (
+            403,
+            r#"{"error":{"message":"Identity verification is required"}}"#,
+            CodexFailureCategory::IdentityVerificationRequired,
+        ),
+        (
+            403,
+            r#"{"error":{"message":"Organization has been disabled"}}"#,
+            CodexFailureCategory::Banned,
+        ),
+        (404, "", CodexFailureCategory::CloudflarePathBlocked),
+    ] {
+        let failure = CodexUpstreamFailure::from_response(
+            reqwest::StatusCode::from_u16(status).unwrap(),
+            body,
+            None,
+            &CodexUpstreamDiagnostics::default(),
+            None,
+            &[],
+            &[],
+            CodexUpstreamSendPhase::BeforePayload,
+        );
+        assert_eq!(failure.category(), category);
+        assert!(!failure.replay_is_safe());
+    }
+}
+
+#[test]
 fn turn_rate_limit_does_not_grant_proxy_replay_or_account_cooldown() {
     for phase in [
         CodexUpstreamSendPhase::BeforePayload,

@@ -77,6 +77,7 @@ fn candidate(id: &str) -> AccountCandidate {
             in_flight: 0,
             last_started_at: None,
             quota_reset_at: None,
+            quota_reset_windows: None,
             quota_remaining_rank: None,
             cooldown: None,
             failure_rate_basis_points: None,
@@ -130,6 +131,7 @@ fn scheduler_can_override_soft_affinity_and_reports_the_override() {
                 Some("demo-model"),
                 &candidates,
                 &mut context(),
+                Default::default(),
             )
             .await
             .unwrap()
@@ -155,6 +157,7 @@ fn delegated_scheduler_keeps_builtin_affinity() {
                 None,
                 &candidates,
                 &mut context(),
+                Default::default(),
             )
             .await
             .unwrap()
@@ -194,6 +197,7 @@ fn explicit_plugin_choices_override_native_soft_affinity() {
                     None,
                     &candidates,
                     &mut selection_context,
+                    Default::default(),
                 )
                 .await
                 .unwrap()
@@ -225,6 +229,7 @@ fn scheduler_cannot_select_outside_the_hard_bound_candidate_pool() {
                 None,
                 &candidates,
                 &mut context,
+                Default::default(),
             )
             .await;
         assert!(matches!(result, Err(AccountPolicyError::Fault)));
@@ -256,6 +261,7 @@ fn filtered_delegation_preserves_native_weights_and_affinity_on_remaining_accoun
                     None,
                     &candidates,
                     &mut context,
+                    Default::default(),
                 )
                 .await
                 .unwrap()
@@ -297,7 +303,8 @@ fn filtered_delegation_covers_busy_candidates_and_does_not_persist_between_selec
                     &ProviderKind::new("openai").unwrap(),
                     None,
                     &candidates,
-                    &mut selection
+                    &mut selection,
+                    Default::default(),
                 )
                 .await
                 .unwrap()
@@ -315,6 +322,7 @@ fn filtered_delegation_covers_busy_candidates_and_does_not_persist_between_selec
                 None,
                 &candidates,
                 &mut context(),
+                Default::default(),
             )
             .await
             .unwrap()
@@ -343,6 +351,7 @@ fn filtering_all_candidates_is_terminal_even_when_the_only_candidate_is_busy_or_
                     None,
                     &candidates,
                     &mut context,
+                    Default::default(),
                 )
                 .await;
             assert!(matches!(result, Err(AccountPolicyError::Filtered)));
@@ -367,6 +376,7 @@ fn filtering_ids_outside_the_host_candidate_pool_is_a_policy_fault() {
                     None,
                     &candidates,
                     &mut context,
+                    Default::default(),
                 )
                 .await;
             assert!(matches!(result, Err(AccountPolicyError::Fault)));
@@ -385,6 +395,7 @@ fn empty_filter_preserves_native_affinity_and_busy_candidates_cannot_be_picked()
                 None,
                 &candidates,
                 &mut context(),
+                Default::default(),
             )
             .await
             .unwrap()
@@ -399,6 +410,7 @@ fn empty_filter_preserves_native_affinity_and_busy_candidates_cannot_be_picked()
                 None,
                 &candidates,
                 &mut context,
+                Default::default(),
             )
             .await;
         assert!(matches!(result, Err(AccountPolicyError::Fault)));

@@ -19,7 +19,7 @@ pub(crate) fn store_usage_filter(filter: admin_observability::UsageFilter) -> Us
     UsageRecordFilter {
         model_contains: filter.model_contains,
         client_api_key_name: filter.client_api_key_name,
-        provider_account_name: filter.provider_account_name,
+        provider_account_search: filter.provider_account_search,
         client_api_key_ref: filter.client_api_key_ref,
         request_id: filter.request_id,
         provider_account_ref: filter.provider_account_ref,
@@ -365,6 +365,7 @@ pub(crate) fn usage_list_record_from_row(
         cost_currency.as_deref(),
     )?;
     Ok(UsageListRecord {
+        has_upstream_error: get(row, "has_upstream_error")?,
         error_code: get(row, "error_code")?,
         error_message: get(row, "error_message")?,
         error_kind: get(row, "error_kind")?,
@@ -374,6 +375,7 @@ pub(crate) fn usage_list_record_from_row(
         upstream_connection_exit_reason: get(row, "upstream_connection_exit_reason")?,
         recovered: get(row, "recovered")?,
         client_status_code: optional_status(row, "client_status_code")?,
+        upstream_status_code: optional_status(row, "upstream_status_code")?,
         outcome: admin_observability::RequestOutcome::new(get::<String>(row, "outcome")?)
             .map_err(|_| invalid("invalid request outcome"))?,
         client_api_key_name: get(row, "client_api_key_name")?,

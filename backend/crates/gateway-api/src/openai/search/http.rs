@@ -11,18 +11,17 @@ use axum::{
 use gateway_core::engine::execution::ClientTransport;
 use gateway_core::error::{GatewayError, GatewayErrorKind};
 use gateway_core::operation::{Operation, OperationKind, RawJsonPayload, StandaloneSearchRequest};
+use gateway_protocol::openai::OPENAI_PROTOCOL;
 
 use crate::ApiState;
 use crate::middleware::headers::encode_headers;
 use crate::openai::middleware::RequestInput;
 use crate::openai::{
-    auth::{authenticate_client, client_access_error_response},
+    auth::{ClientKeyHeaders, authenticate_client, client_access_error_response},
     endpoint::provider_endpoint_response,
     responses::{OpenAiRequestHeaders, request_client_context},
     router::SEARCH_PATH,
 };
-
-const OPENAI_PROTOCOL: &str = "openai";
 
 /// `POST /v1/alpha/search`
 pub(crate) async fn standalone_search(
@@ -32,7 +31,7 @@ pub(crate) async fn standalone_search(
     body: Bytes,
 ) -> Response {
     let service = state.openai();
-    let client = match authenticate_client(service, &headers).await {
+    let client = match authenticate_client(service, &headers, ClientKeyHeaders::Bearer).await {
         Ok(client) => client,
         Err(error) => return client_access_error_response(error),
     };

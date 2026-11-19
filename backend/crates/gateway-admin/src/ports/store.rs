@@ -22,8 +22,9 @@ use crate::model::{
     },
     auth::{AdminAuditEvent, AuthSession},
     client_keys::{
-        ClientKeyBudgetMutationOrigin, ClientKeyListQuery, ClientKeyPage, ClientKeyRecord,
-        ClientKeySecret, DeleteClientKey, NewClientKey, ResetClientKeyBudget, SetClientKeyEnabled,
+        ClientKeyBudgetMutationOrigin, ClientKeyBudgetWindow, ClientKeyBudgetWindowPeriod,
+        ClientKeyListQuery, ClientKeyPage, ClientKeyRecord, ClientKeySecret, DeleteClientKey,
+        NewClientKey, ResetClientKeyBudget, SetClientKeyBudgetWindow, SetClientKeyEnabled,
         UpdateClientKey, UpdateClientKeyBudgetLimits,
     },
     observability::{
@@ -179,6 +180,16 @@ pub trait AccountStore:
         windows: &[AccountUsageWindowQuery],
     ) -> AdminStoreResult<Vec<AccountUsageWindowResult>>;
 
+    /// 按完成时间倒序读取一页保留的请求观测，不按本地计费结果筛选
+    async fn quota_documents(
+        &self,
+        account: &gateway_core::account::ProviderAccountId,
+        provider: &gateway_core::routing::ProviderKind,
+        created_at: DateTime<Utc>,
+        range: TimeRange,
+        before: Option<&crate::model::quota_history::QuotaHistoryCursor>,
+    ) -> AdminStoreResult<crate::model::quota_history::QuotaDocumentPage>;
+
     /// 从同一数据库语句取得截止快照的累计用量和有界历史观测
     async fn load_quota_forecast_history(
         &self,
@@ -254,6 +265,7 @@ pub trait AccountStore:
     async fn batch_update_accounts(
         &self,
         command: BatchUpdateAccounts,
+        pauses: crate::model::accounts::PreparedQuotaPauses,
         context: &MutationContext,
     ) -> AdminStoreResult<AccountsUpdateResult>;
 
@@ -365,6 +377,19 @@ pub trait AuthStore: Send + Sync {
 /// Client API Key 资料读取与管理写入
 #[async_trait]
 pub trait ClientKeyStore: Send + Sync {
+    async fn client_key_budget_window(
+        &self,
+        id: &gateway_core::policy::ClientApiKeyId,
+        period: ClientKeyBudgetWindowPeriod,
+    ) -> AdminStoreResult<ClientKeyBudgetWindow>;
+
+    async fn set_client_key_budget_window(
+        &self,
+        command: SetClientKeyBudgetWindow,
+        origin: ClientKeyBudgetMutationOrigin,
+        context: &MutationContext,
+    ) -> AdminStoreResult<u64>;
+
     /// 按已验证的 ID 读取资料，不读取完整明文 Key
     async fn get_client_key(
         &self,

@@ -5,6 +5,7 @@
 //! - [`evidence`]：额度接口错误到凭据/额度事实的分类
 //! - [`recovery`]：各额度窗口独立的恢复基准与访问结论
 
+mod bucket_warmup;
 mod document;
 pub(crate) mod evidence;
 mod passive;
@@ -15,6 +16,9 @@ mod service;
 pub(crate) mod snapshot;
 mod warmup;
 
+const BUCKET_USAGE_FIELD: &str = "_cpr_bucket_last_used_at";
+
+pub(crate) use passive::observed_quota_window;
 pub use reset_credits::CodexResetCreditsError;
 use reset_credits::ResetCreditLocks;
 use scheduling::CodexQuotaSchedulingProjection;
@@ -31,8 +35,8 @@ use futures::StreamExt as _;
 use gateway_core::account::{
     AccountErrorReason, AccountQuotaSignals, CredentialRevision, CredentialState,
     OpaqueProviderData, ProviderAccount, ProviderAccountId, ProviderAccountStore,
-    QuotaAccessChange, QuotaAccessState, QuotaEvidence, QuotaObservation, QuotaObservationTouch,
-    QuotaState, QuotaWriteOutcome,
+    QuotaAccessChange, QuotaAccessState, QuotaEvidence, QuotaMergeBase, QuotaObservation,
+    QuotaObservationTouch, QuotaState, QuotaWriteOutcome,
 };
 use gateway_core::provider_ports::{
     ProviderCooldown, ProviderCooldownPort, ProviderRuntimePolicyPort,
@@ -68,6 +72,9 @@ use snapshot::{
     scheduling_signals_from_snapshot,
 };
 
+// 同一份上游观测只重做本地合并，高并发时不无限争抢写入
+const QUOTA_MERGE_ATTEMPTS: usize = 3;
+const LIMIT_EVIDENCE_FIELD: &str = "_cpr_quota_limit_evidence";
 const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 pub(crate) const QUOTA_SCHEDULING_TTL: Duration = Duration::from_secs(10 * 60);
 const QUOTA_HYDRATION_FAILURE_TTL: Duration = Duration::from_secs(5);
@@ -137,6 +144,8 @@ pub struct CodexWarmupSummary {
 
 #[derive(Debug, Error)]
 pub enum CodexCredentialQuotaError {
+    #[error("Codex warmup client profile is unavailable")]
+    Profile(#[source] gateway_core::error::ErrorSource),
     #[error("Codex quota response is invalid")]
     InvalidCredentialData,
     #[error("Codex OAuth access token must be refreshed before querying quota")]

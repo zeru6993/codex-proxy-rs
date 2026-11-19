@@ -15,10 +15,11 @@ use gateway_core::lifecycle::{ConnectionDraining, ConnectionGuard, ConnectionLif
 use gateway_core::routing::{
     ProviderCatalogUnavailable, ProviderKind, PublicModelDescriptor, PublicModelId, UpstreamModelId,
 };
+use gateway_protocol::openai::OPENAI_PROTOCOL;
 use uuid::Uuid;
 
 use super::auth::ClientApiKeyAuthError;
-use super::responses::{ContinuationIntent, DecodedResponsesRequest};
+use super::responses::{ContinuationIntent, DecodedGenerationRequest};
 
 /// OpenAI HTTP/WS adapter 共享的 Core 与连接生命周期能力
 #[derive(Clone)]
@@ -76,8 +77,14 @@ impl OpenAiService {
         client: &AuthenticatedClient,
         client_version: &str,
     ) -> Result<Vec<PublicModelDescriptor>, ProviderCatalogUnavailable> {
+        let context = crate::middleware::current();
         self.execution
-            .client_model_catalog(client, "codex", client_version)
+            .client_model_catalog(
+                client,
+                "codex",
+                client_version,
+                context.as_ref().and_then(|ctx| ctx.extensions.peer_route()),
+            )
             .await
     }
 
@@ -89,14 +96,15 @@ impl OpenAiService {
         self.execution.contains_public_model(client, model)
     }
 
-    pub(crate) async fn start_prepared_response(
+    pub(crate) async fn start_prepared_generation(
         &self,
         prepared: PreparedRootExecution,
-        request: DecodedResponsesRequest,
+        request: DecodedGenerationRequest,
         transport: ClientTransport,
         endpoint: &'static str,
     ) -> Result<StartedExecution, GatewayError> {
         let (operation, metadata) = request.into_parts();
+        let protocol = operation.protocol().to_owned();
         let public_model = PublicModelId::from_client_wire(metadata.requested_model().to_owned())
             .map_err(|_| {
             GatewayError::new(
@@ -117,7 +125,7 @@ impl OpenAiService {
                     public_model,
                     operation,
                     metadata: ExecutionRequestMetadata {
-                        protocol: "openai".to_owned(),
+                        protocol,
                         endpoint: endpoint.to_owned(),
                         transport,
                         stream: metadata.stream(),
@@ -152,7 +160,7 @@ impl OpenAiService {
                 upstream_model,
                 operation,
                 ExecutionRequestMetadata {
-                    protocol: "openai".to_owned(),
+                    protocol: OPENAI_PROTOCOL.to_owned(),
                     endpoint,
                     transport: ClientTransport::HttpJson,
                     stream: false,

@@ -40,6 +40,7 @@ pub(super) fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettin
             openai_session_affinity_ttl_hours: 24,
             responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
             smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
+            quota_reset_window_weights: gateway_core::account::ResetWindowWeights::default(),
             min_codex_desktop_version: None,
             min_codex_cli_version: None,
             usage_retention_days: 31,
@@ -47,9 +48,10 @@ pub(super) fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettin
             audit_retention_days: 90,
             account_error_protection: enabled_protection(),
             account_warmup_enabled: false,
-            account_warmup_schedule_time: "08:00".to_owned(),
+            account_warmup_cron: "0 8 * * *".to_owned(),
             account_warmup_model: None,
             reset_credit_lead_minutes: 10,
+            reset_credit_on_low_weekly_quota: false,
             reset_credit_max_weekly_remaining_percent: None,
         },
     }
@@ -112,7 +114,7 @@ async fn privacy_policy_defaults_off_and_round_trips_in_snapshot() {
 }
 
 #[tokio::test]
-async fn smart_settings_round_trip_publish_and_restore_database_defaults() {
+async fn scheduling_settings_round_trip_publish_and_restore_database_defaults() {
     use gateway_core::account::SmartSchedulingConfig;
     use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
     let Some(database) = TestDatabase::create("smart_config").await else {
@@ -125,20 +127,29 @@ async fn smart_settings_round_trip_publish_and_restore_database_defaults() {
         SmartSchedulingConfig::default()
     );
     let mut update = settings_with_margin(3600);
-    update.values.smart_scheduling =
-        SmartSchedulingConfig::new([0.0, 2.0, 1.0, 0.5, 1.2, 2.3]).unwrap();
-    let expected = update.values.smart_scheduling;
+    let windows = gateway_core::account::ResetWindowWeights::new([0.0, 1.5, 0.0]).unwrap();
+    update.values.quota_reset_window_weights = windows;
+    let expected = serde_json::json!({
+        "loadWeight": 0.0, "quotaWeight": 2.0, "healthWeight": 1.0, "latencyWeight": 0.5, "resetWeight": 1.2, "queueWeight": 2.3,
+        "resetWindowWeights": {"fiveHour":2.0,"weekly":8.0,"monthly":0.0}
+    });
+    update.values.smart_scheduling = serde_json::from_value(expected.clone()).unwrap();
     repository.update_runtime_settings(update).await.unwrap();
     let reloaded = repository.load_runtime_settings().await.unwrap();
-    assert_eq!(reloaded.values.smart_scheduling, expected);
+    assert_eq!(
+        serde_json::to_value(reloaded.values.smart_scheduling).unwrap(),
+        expected
+    );
+    assert_eq!(reloaded.values.quota_reset_window_weights, windows);
     let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
         .load_runtime_snapshot()
         .await
         .unwrap();
     let snapshot_values = serde_json::to_value(&snapshot.settings).unwrap();
+    assert_eq!(snapshot_values["smart_scheduling"], expected);
     assert_eq!(
-        snapshot_values["smart_scheduling"],
-        serde_json::to_value(expected).unwrap()
+        snapshot_values["quota_reset_window_weights"],
+        serde_json::to_value(windows).unwrap()
     );
     assert!(snapshot.config_revision > before.config_revision);
     sqlx::query("update runtime_settings set smart_scheduling_json = default where id = 1")
@@ -180,7 +191,7 @@ async fn warmup_settings_round_trip_with_database_constraint() {
     let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
     let mut update = settings_with_margin(3_600);
     update.values.account_warmup_enabled = true;
-    update.values.account_warmup_schedule_time = "08:00,13:00".to_owned();
+    update.values.account_warmup_cron = "0 8,13 * * MON-FRI;59 10 * * *".to_owned();
     update.values.account_warmup_model = Some("test-model".to_owned());
     repository
         .update_runtime_settings(update)
@@ -192,7 +203,10 @@ async fn warmup_settings_round_trip_with_database_constraint() {
         .await
         .expect("load warmup settings");
     assert!(settings.values.account_warmup_enabled);
-    assert_eq!(settings.values.account_warmup_schedule_time, "08:00,13:00");
+    assert_eq!(
+        settings.values.account_warmup_cron,
+        "0 8,13 * * MON-FRI;59 10 * * *"
+    );
     assert_eq!(
         settings.values.account_warmup_model.as_deref(),
         Some("test-model")
@@ -1009,6 +1023,13 @@ async fn request_profile_projection_is_revision_consistent_and_includes_key_over
     };
     let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
     let provider = ProviderKind::new("xai").unwrap();
+    assert!(
+        repository
+            .load_request_profile(&provider)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let document = |marker: &str| {
         OpaqueProviderData::new(
             serde_json::json!({"marker":marker})
@@ -1050,6 +1071,10 @@ async fn request_profile_projection_is_revision_consistent_and_includes_key_over
     assert_eq!(profiles.len(), 2);
     assert!(profiles.contains(&document("global")));
     assert!(profiles.contains(&document("key")));
+    assert_eq!(
+        repository.load_request_profile(&provider).await.unwrap(),
+        Some(document("global"))
+    );
 
     repository
         .update_runtime_settings(settings_with_margin(7200))
@@ -1248,19 +1273,15 @@ async fn reset_credit_weekly_threshold_defaults_unset_and_round_trips() {
         settings.values.reset_credit_max_weekly_remaining_percent,
         None
     );
+    assert!(!settings.values.reset_credit_on_low_weekly_quota);
     for threshold in [Some(70), Some(0), Some(100), None] {
         let mut update = settings_with_margin(600);
+        update.values.reset_credit_on_low_weekly_quota = true;
         update.values.reset_credit_max_weekly_remaining_percent = threshold;
         repository.update_runtime_settings(update).await.unwrap();
-        assert_eq!(
-            repository
-                .load_runtime_settings()
-                .await
-                .unwrap()
-                .values
-                .reset_credit_max_weekly_remaining_percent,
-            threshold
-        );
+        let values = repository.load_runtime_settings().await.unwrap().values;
+        assert!(values.reset_credit_on_low_weekly_quota);
+        assert_eq!(values.reset_credit_max_weekly_remaining_percent, threshold);
     }
     for threshold in [-1, 101] {
         assert!(sqlx::query("update runtime_settings set reset_credit_max_weekly_remaining_percent = $1 where id = 1")

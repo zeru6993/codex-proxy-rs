@@ -140,6 +140,7 @@ impl SelectorFixture {
                     in_flight: 0,
                     last_started_at: None,
                     quota_reset_at: None,
+                    quota_reset_windows: None,
                     quota_remaining_rank: None,
                     cooldown: None,
                     failure_rate_basis_points: None,
@@ -266,6 +267,7 @@ impl SelectorFixture {
         let outcome = self
             .store
             .compare_and_swap_quota(QuotaObservation {
+                quota_pause: None,
                 expected_connection: None,
                 plan_type: None,
                 account_id: id.clone(),

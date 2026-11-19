@@ -124,6 +124,7 @@ impl AttemptTrigger {
 /// 一旦设置，Provider 在本 attempt 内不得换号或切换 target
 #[derive(Debug, Clone, Default)]
 pub struct AccountAttemptContext {
+    excluded_proxy_endpoints: Vec<crate::upstream::ProxyEndpoint>,
     excluded_accounts: BTreeSet<ProviderAccountId>,
     required_account: Option<ProviderAccountId>,
     state_owner: Option<ProviderAccountStateOwner>,
@@ -140,6 +141,7 @@ impl AccountAttemptContext {
         state_owner: Option<ProviderAccountStateOwner>,
     ) -> Self {
         Self {
+            excluded_proxy_endpoints: Vec::new(),
             excluded_accounts,
             required_account,
             state_owner,
@@ -160,6 +162,7 @@ impl AccountAttemptContext {
     ) -> Self {
         let (required_account, eligibility) = target.into_selection();
         Self {
+            excluded_proxy_endpoints: Vec::new(),
             excluded_accounts,
             required_account: Some(required_account),
             state_owner,
@@ -265,6 +268,8 @@ pub enum ContinuationAttempt {
     ///
     /// 该枚举本身不证明客户端 input 完整，也不授权 Provider 清除 previous-response
     ReplayAny,
+    /// 仅迁移账号绑定，随后要求客户端携带完整历史重放；不得发送当前增量输入
+    RotateForClientReplay,
 }
 
 impl ContinuationAttempt {
@@ -275,6 +280,7 @@ impl ContinuationAttempt {
             Self::Native => "native",
             Self::ReplayOwner => "replay_owner",
             Self::ReplayAny => "replay_any",
+            Self::RotateForClientReplay => "rotate_for_client_replay",
         }
     }
 }
@@ -593,7 +599,9 @@ impl AttemptContext {
                     .account_state_owner()
                     .filter(|owner| owner.provider() == provider)
                     .map(|owner| owner.account()),
-                ContinuationAttempt::None | ContinuationAttempt::ReplayAny => None,
+                ContinuationAttempt::None
+                | ContinuationAttempt::ReplayAny
+                | ContinuationAttempt::RotateForClientReplay => None,
             });
         self.request.upstream_adapters.as_ref().map_or(
             Ok(upstream_adapter::UpstreamAdapterSelection::Native),
@@ -896,6 +904,17 @@ impl AttemptContext {
         self.account.excluded_accounts()
     }
 
+    #[must_use]
+    pub fn excludes_proxy(&self, proxy: Option<&crate::account::OutboundProxy>) -> bool {
+        !self.account.excluded_proxy_endpoints.is_empty()
+            && proxy.is_some_and(|proxy| {
+                self.account
+                    .excluded_proxy_endpoints
+                    .iter()
+                    .any(|endpoint| proxy.matches_endpoint(endpoint))
+            })
+    }
+
     /// 管理端诊断或请求局部恢复 attempt 强制使用的唯一账号
     #[must_use]
     pub const fn required_account(&self) -> Option<&ProviderAccountId> {
@@ -963,11 +982,19 @@ impl AttemptContext {
         model: Option<&str>,
         candidates: &'a [AccountCandidate],
         context: &mut AccountSelectionContext,
+        ownership: policy::AccountScheduleOwnership<'_>,
     ) -> Result<Option<AccountSelection<'a>>, policy::AccountPolicyError> {
         match self.request.request_policy() {
             Some(policy) => {
                 policy
-                    .select_account(self.attempt_index, provider, model, candidates, context)
+                    .select_account(
+                        self.attempt_index,
+                        provider,
+                        model,
+                        candidates,
+                        context,
+                        ownership,
+                    )
                     .await
             }
             None => Ok(crate::account::AccountSelector.select(candidates, context)),

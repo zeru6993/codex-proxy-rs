@@ -308,6 +308,21 @@ impl MemoryProviderAccountStore {
 
 #[async_trait]
 impl ProviderAccountStore for MemoryProviderAccountStore {
+    async fn load_account_catalogs(
+        &self,
+        _: &gateway_core::routing::ProviderKind,
+    ) -> Result<Vec<gateway_core::account::StoredAccountCatalog>, gateway_core::error::StoreError>
+    {
+        Ok(Vec::new())
+    }
+    async fn save_account_catalog(
+        &self,
+        _: &gateway_core::account::AccountCatalogObservation,
+        _: &[u8],
+    ) -> Result<bool, gateway_core::error::StoreError> {
+        unreachable!("fixture does not discover account catalogs")
+    }
+
     async fn create_account(&self, account: NewProviderAccount) -> Result<(), StoreError> {
         let mut accounts = lock(&self.accounts);
         if accounts.contains_key(account.account.id()) {
@@ -821,24 +836,19 @@ impl ProviderSessionAffinityPort for TestSessionAffinity {
     > {
         Box::pin(async { Ok(None) })
     }
-    fn compare_and_bind<'a>(
+    fn round_robin_cursor<'a>(
         &'a self,
         _: &'a ProviderKind,
-        _: &'a ProviderSessionAffinityKey,
-        _: Option<&'a gateway_core::provider_ports::ProviderSessionBinding>,
-        account: &'a ProviderAccountId,
-        _: Duration,
-    ) -> futures::future::BoxFuture<
-        'a,
-        Result<Option<gateway_core::provider_ports::ProviderSessionBinding>, ProviderStoreError>,
-    > {
-        Box::pin(async move {
-            gateway_core::provider_ports::ProviderSessionBinding::new(
-                account.clone(),
-                "00000000000000000000000000000000".to_owned(),
-            )
-            .map(Some)
-        })
+        _: &'a gateway_core::policy::ClientApiKeyId,
+    ) -> futures::future::BoxFuture<'a, Result<u64, ProviderStoreError>> {
+        panic!("xAI does not read session round robin cursors")
+    }
+    fn admit_account<'a>(
+        &'a self,
+        _: &'a ProviderKind,
+        _: gateway_core::provider_ports::ProviderAccountAdmission<'a>,
+    ) -> futures::future::BoxFuture<'a, Result<bool, ProviderStoreError>> {
+        panic!("xAI does not claim OpenAI sessions")
     }
     fn load_alias<'a>(
         &'a self,

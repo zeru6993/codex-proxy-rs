@@ -51,6 +51,7 @@ fn runtime_settings(enabled: bool, probe_enabled: bool) -> RuntimeSettings {
             openai_session_affinity_ttl_hours: 24,
             responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
             smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
+            quota_reset_window_weights: gateway_core::account::ResetWindowWeights::default(),
             min_codex_desktop_version: None,
             min_codex_cli_version: None,
             usage_retention_days: 31,
@@ -73,9 +74,10 @@ fn runtime_settings(enabled: bool, probe_enabled: bool) -> RuntimeSettings {
                 ..Default::default()
             },
             account_warmup_enabled: false,
-            account_warmup_schedule_time: "08:00".to_owned(),
+            account_warmup_cron: "0 8 * * *".to_owned(),
             account_warmup_model: None,
             reset_credit_lead_minutes: 10,
+            reset_credit_on_low_weekly_quota: false,
             reset_credit_max_weekly_remaining_percent: None,
         },
     }

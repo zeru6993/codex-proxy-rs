@@ -28,7 +28,7 @@ pub(super) fn is_managed_identity_header(name: &str) -> bool {
             | "chatgpt-project-id"
             | "openai-organization"
             | "openai-project"
-            // 安装头与 client_metadata 共用本次请求的安装身份
+            // 安装身份由所选账号生成，不继承下游安装头
             | "x-codex-installation-id"
             // 画像和设备证明须属于选定账号，不能由下游覆盖
             | "originator"
@@ -119,18 +119,25 @@ impl CodexBackendClient {
         profile: &CodexWireProfile,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<HeaderMap> {
+        if self.protocol == OpenAiUpstreamProtocol::MessagesApi {
+            let mut headers = HeaderMap::new();
+            let api_key = context
+                .authorization
+                .strip_prefix("Bearer ")
+                .unwrap_or(context.authorization);
+            headers.insert("x-api-key", HeaderValue::from_str(api_key)?);
+            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+            return Ok(headers);
+        }
         // 客户端画像与认证方式无关；API Key 不携带 OAuth 账号身份和 Cookie
         let (account_id, cookie_header) = match self.protocol {
             OpenAiUpstreamProtocol::Codex => (context.account_id, context.cookie_header),
-            OpenAiUpstreamProtocol::ResponsesApi => (None, None),
+            OpenAiUpstreamProtocol::ResponsesApi | OpenAiUpstreamProtocol::MessagesApi => {
+                (None, None)
+            }
         };
         let mut headers = build_codex_model_headers(profile, context.authorization, account_id)?;
         insert_optional_header(&mut headers, "cookie", cookie_header)?;
-        insert_optional_header(
-            &mut headers,
-            "x-codex-installation-id",
-            context.installation_id,
-        )?;
         Ok(headers)
     }
 
@@ -204,11 +211,6 @@ impl CodexBackendClient {
             ("x-codex-window-id", context.codex_window_id),
             ("x-codex-turn-state", context.turn_state),
             ("x-codex-turn-metadata", context.turn_metadata),
-            ("x-codex-beta-features", context.beta_features),
-            (
-                "x-responsesapi-include-timing-metrics",
-                context.include_timing_metrics,
-            ),
             ("x-codex-parent-thread-id", context.parent_thread_id),
             (
                 X_OPENAI_MEMGEN_REQUEST_HEADER,

@@ -251,6 +251,27 @@ struct PricingRule {
 // 已按 https://developers.openai.com/api/docs/deprecations 核验至 2026-09-13，
 // 移除已关闭的型号；仅宣布弃用但尚未到关闭日期的型号继续保留
 const PRICING_RULES: &[PricingRule] = &[
+    // GPT-6.2 的 Ultrafast 使用官方价目表中的 6 倍常规价，核验日期 2026-11-18
+    PricingRule {
+        model: "gpt-6.2-astra",
+        pricing: ModelPricing::new(80_000, 400_000, 4_000)
+            .with_cache_write(125)
+            .with_fast(160_000, 800_000, 8_000)
+            .with_ultrafast(480_000, 2_400_000, 24_000)
+            .with_long(160_000, 600_000, 8_000)
+            .with_long_fast(320_000, 1_200_000, 16_000)
+            .with_long_ultrafast(960_000, 3_600_000, 48_000),
+    },
+    PricingRule {
+        model: "gpt-6.2-sol",
+        pricing: ModelPricing::new(20_000, 100_000, 1_000)
+            .with_cache_write(125)
+            .with_fast(40_000, 200_000, 2_000)
+            .with_ultrafast(120_000, 600_000, 6_000)
+            .with_long(40_000, 150_000, 2_000)
+            .with_long_fast(80_000, 300_000, 4_000)
+            .with_long_ultrafast(240_000, 900_000, 12_000),
+    },
     // Astra：https://developers.openai.com/api/docs/models/gpt-6-astra
     // 已于 2026-09-09 对照官方价目表核验
     PricingRule {
@@ -535,8 +556,8 @@ pub fn openai_billing_breakdown(
     usage: OpenAiBillingUsage,
     service_tier: Option<&str>,
 ) -> Option<CalculatedCostBreakdown> {
-    openai_billing_breakdown_with_context(
-        model,
+    token_billing_breakdown_with_context(
+        model_pricing(model),
         usage,
         service_tier,
         usage.input_tokens > LONG_CONTEXT_THRESHOLD,
@@ -552,8 +573,8 @@ pub fn openai_billing_breakdown_with_override(
     service_tier: Option<&str>,
     pricing: Option<&gateway_core::metering::ModelPriceOverride>,
 ) -> Option<CalculatedCostBreakdown> {
-    openai_billing_breakdown_with_context(
-        model,
+    token_billing_breakdown_with_context(
+        model_pricing(model),
         usage,
         service_tier,
         usage.input_tokens > LONG_CONTEXT_THRESHOLD,
@@ -561,8 +582,16 @@ pub fn openai_billing_breakdown_with_override(
     )
 }
 
-fn openai_billing_breakdown_with_context(
-    model: &str,
+/// 其他 API 协议仅使用明确配置的标准 Token 单价，不继承 OpenAI 型号与档位规则
+pub(crate) fn configured_token_billing_breakdown(
+    usage: OpenAiBillingUsage,
+    pricing: &gateway_core::metering::ModelPriceOverride,
+) -> Option<CalculatedCostBreakdown> {
+    token_billing_breakdown_with_context(None, usage, None, false, Some(pricing))
+}
+
+fn token_billing_breakdown_with_context(
+    pricing: Option<ModelPricing>,
     usage: OpenAiBillingUsage,
     service_tier: Option<&str>,
     long_context: bool,
@@ -579,7 +608,6 @@ fn openai_billing_breakdown_with_context(
     }
     let tool_ticks = web_search_amount_ticks(usage)?
         .checked_add(u128::from(usage.file_search_calls).checked_mul(FILE_SEARCH_CALL_TICKS)?)?;
-    let pricing = model_pricing(model);
     let normalized_tier = normalize_service_tier(service_tier);
     let tier = pricing_tier(normalized_tier.as_deref())?;
     let (standard_rates, _) =
@@ -917,7 +945,13 @@ fn reasoning_model(model: &str) -> bool {
     model.starts_with("gpt-5")
         || matches!(
             model,
-            "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-sol" | "gpt-6-luna"
+            "gpt-6.2-astra"
+                | "gpt-6.2-sol"
+                | "gpt-6-astra"
+                | "gpt-6.1-sol"
+                | "gpt-6.1-terra"
+                | "gpt-6-sol"
+                | "gpt-6-luna"
         )
         || model.starts_with("o1")
         || model.starts_with("o3")

@@ -1,6 +1,6 @@
 import type { Ref } from 'vue'
 import type { UsageTimeRangeParams } from './useUsageTimeRange'
-import type { UsageRecordStatus } from '@/api'
+import type { UsageErrorOrigin, UsageRecordStatus } from '@/api'
 
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { getUsageRecords } from '@/api'
@@ -12,6 +12,7 @@ interface UseUsageRecordsTableOptions {
   timeRangeParams: Readonly<Ref<UsageTimeRangeParams>>
   latestTimeRangeParams: () => UsageTimeRangeParams
   status: Readonly<Ref<UsageRecordStatus>>
+  errorOrigin: Readonly<Ref<UsageErrorOrigin | 'all'>>
 }
 
 type UsageLoadScope = 'all' | 'table'
@@ -30,7 +31,7 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
       clientApiKeyName: filterField.value === 'key'
         ? value
         : undefined,
-      accountName: filterField.value === 'account'
+      accountSearch: filterField.value === 'account'
         ? value
         : undefined,
       model: filterField.value === 'model'
@@ -68,13 +69,16 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
       provider: providerQuery.value || undefined,
       ...filterParams.value,
       status: options.status.value,
+      errorOrigin: options.status.value === 'error' && options.errorOrigin.value !== 'all'
+        ? options.errorOrigin.value
+        : undefined,
     }
   }
 
   function filterChanged() {
     const filter = filterParams.value
     return tableParams.clientApiKeyName !== filter.clientApiKeyName
-      || tableParams.accountName !== filter.accountName
+      || tableParams.accountSearch !== filter.accountSearch
       || tableParams.model !== filter.model
   }
 
@@ -144,7 +148,7 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
     void loadUsageRecords()
   })
 
-  watch(options.status, () => {
+  watch([options.status, options.errorOrigin], () => {
     void reloadLatestTable()
   })
 

@@ -7,6 +7,7 @@ mod error;
 mod image_policy;
 mod images;
 mod live;
+mod messages;
 mod middleware;
 mod models;
 mod peer_link;
@@ -133,6 +134,7 @@ pub(crate) fn api_bundle_with_diagnostics(
         Arc::new(crate::support::RecordingDiagnostics::default()),
     ));
     gateway_api::initialize(
+        uuid::Uuid::nil(),
         config,
         execution,
         admin,
@@ -150,6 +152,7 @@ fn api_router_with_config_and_execution(
     execution: Arc<dyn ExecutionService>,
 ) -> axum::Router {
     gateway_api::initialize(
+        uuid::Uuid::nil(),
         config,
         execution,
         admin,
@@ -188,6 +191,7 @@ async fn api_router_with_origins_and_worker_health(
 ) -> axum::Router {
     let admin = crate::admin::AdminTestFixture::new().await;
     gateway_api::initialize(
+        uuid::Uuid::nil(),
         gateway_api::ApiConfig {
             asset_directory: std::env::temp_dir(),
             cors_allowed_origins,

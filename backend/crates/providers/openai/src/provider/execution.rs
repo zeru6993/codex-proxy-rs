@@ -4,6 +4,7 @@ use gateway_core::metering::{CalculatedCost, Usage};
 
 use super::*;
 use crate::credential::CodexSelectionModel;
+use crate::transport::CodexTransportDecision;
 use gateway_core::operation::RawJsonPayload;
 
 impl CodexProvider {
@@ -13,7 +14,7 @@ impl CodexProvider {
         candidate: &ProviderCandidate,
         context: AttemptContext,
     ) -> Result<ProviderStream, ProviderError> {
-        if image.payload().protocol() != PROVIDER_NAME || candidate.upstream_model().is_some() {
+        if image.payload().protocol() != OPENAI_PROTOCOL || candidate.upstream_model().is_some() {
             return Err(provider_error(
                 ProviderErrorKind::InvalidRequest,
                 UpstreamSendState::NotSent,
@@ -112,7 +113,7 @@ impl CodexProvider {
         candidate: &ProviderCandidate,
         context: AttemptContext,
     ) -> Result<ProviderStream, ProviderError> {
-        if search.payload().protocol() != PROVIDER_NAME || candidate.upstream_model().is_some() {
+        if search.payload().protocol() != OPENAI_PROTOCOL || candidate.upstream_model().is_some() {
             return Err(provider_error(
                 ProviderErrorKind::InvalidRequest,
                 UpstreamSendState::NotSent,
@@ -255,7 +256,8 @@ impl CodexProvider {
                         UpstreamSendState::NotSent,
                     ));
                 };
-                if image.kind() != original.kind() || image.payload().protocol() != PROVIDER_NAME {
+                if image.kind() != original.kind() || image.payload().protocol() != OPENAI_PROTOCOL
+                {
                     return Err(provider_error(
                         ProviderErrorKind::InvalidRequest,
                         UpstreamSendState::NotSent,
@@ -271,7 +273,7 @@ impl CodexProvider {
             }
             Operation::Search(search) => {
                 if !matches!(&request.operation, Operation::Search(_))
-                    || search.payload().protocol() != PROVIDER_NAME
+                    || search.payload().protocol() != OPENAI_PROTOCOL
                 {
                     return Err(provider_error(
                         ProviderErrorKind::InvalidRequest,
@@ -330,7 +332,7 @@ impl CodexProvider {
         ));
         // Standalone Provider 端点没有可证明的账号 owner；Images/Search metadata 必须按
         // 跨账号输入收敛到当前 lease，不能沿用下游声明的账号或 installation identity
-        let client = self.client_for_request(&context)?;
+        let client = self.client_for_request(&context, lease.account())?;
         let installation_id = client.profile_state().effective_installation_id(
             context.client_api_key_ref(),
             lease.account_id(),
@@ -351,7 +353,7 @@ impl CodexProvider {
             installation_id,
             client: client
                 .for_account(lease.account())
-                .map_err(|error| map_client_error(error, UpstreamSendState::NotSent, false).error)?
+                .map_err(|error| map_client_error(error, UpstreamSendState::NotSent, None).error)?
                 .with_responses_api_base_url(lease.authentication().responses_api_base_url())
                 .with_middleware_headers(middleware_headers)
                 .with_outbound_middleware(outbound_middleware)
@@ -432,10 +434,6 @@ pub(super) struct OpenAiSessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) oauth_identity: Option<String>,
     pub(super) conversation_id: Option<String>,
-    #[serde(default)]
-    pub(super) turn_state: Option<String>,
-    #[serde(default)]
-    pub(super) client_turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reasoning_effort_override: Option<String>,
     pub(super) continuation_scope: OpenAiContinuationScope,
@@ -454,18 +452,10 @@ pub(super) struct OpenAiSessionCapture {
     pub(super) credential_revision: Option<u64>,
     pub(super) oauth_identity: Option<String>,
     pub(super) conversation_id: Option<String>,
-    pub(super) turn_state: Option<String>,
-    pub(super) client_turn_id: Option<String>,
     pub(super) reasoning_effort_override: Option<String>,
     pub(super) response_store: bool,
     pub(super) oversized_http: bool,
     pub(super) continuation_scope: Option<OpenAiContinuationScope>,
-}
-
-pub(super) fn same_client_turn(previous: Option<&str>, current: Option<&str>) -> bool {
-    previous
-        .zip(current)
-        .is_some_and(|(previous, current)| !previous.is_empty() && previous == current)
 }
 
 pub(super) fn decode_openai_session_state(request: &GenerateRequest) -> Option<OpenAiSessionState> {
@@ -503,8 +493,6 @@ fn encode_openai_session_capture(
         credential_revision: capture.credential_revision,
         oauth_identity: capture.oauth_identity.clone(),
         conversation_id: capture.conversation_id.clone(),
-        turn_state: capture.turn_state.clone(),
-        client_turn_id: capture.client_turn_id.clone(),
         reasoning_effort_override: capture.reasoning_effort_override.clone(),
         continuation_scope,
     })
@@ -538,7 +526,7 @@ pub(super) fn attach_openai_session_update(
 
 pub(super) fn terminal_response_output(event: &ProviderEvent) -> Option<&[Value]> {
     let wire = event.wire_event()?;
-    if wire.protocol() != PROVIDER_NAME {
+    if wire.protocol() != OPENAI_PROTOCOL {
         return None;
     }
     let event_type = wire
@@ -588,9 +576,12 @@ pub(super) async fn create_response_attempt(
 
 pub(super) fn map_handshake_attempt_error(
     error: CodexHandshakeAttemptError,
+    account: &ProviderAccount,
 ) -> MappedProviderFailure {
     match error {
-        CodexHandshakeAttemptError::Client(error) => map_handshake_error(error),
+        CodexHandshakeAttemptError::Client(error) => {
+            map_client_error(error, UpstreamSendState::Ambiguous, Some(account))
+        }
         CodexHandshakeAttemptError::Cancelled => MappedProviderFailure::plain(provider_error(
             ProviderErrorKind::Cancelled,
             UpstreamSendState::Ambiguous,
@@ -683,7 +674,7 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
                 error,
             );
         }
-        let response = match response.map_err(map_handshake_attempt_error) {
+        let response = match response.map_err(|error| map_handshake_attempt_error(error, &active_account)) {
             Ok(response) => response,
             Err(mut failure) => {
                 if let Some(observation) = failure.observation.take() {
@@ -716,6 +707,7 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
                 &active_account,
                 &response.rate_limit_headers,
                 image_endpoint,
+                true,
             )
             .await;
             if !response.set_cookie_headers.is_empty()
@@ -747,7 +739,7 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
                 yield ProviderEvent::canonical(GatewayEvent::CalculatedCost(cost));
             }
         }
-        let wire = ProtocolWireEvent::raw_json(PROVIDER_NAME, response.body).map_err(|_| {
+        let wire = ProtocolWireEvent::raw_json(OPENAI_PROTOCOL, response.body).map_err(|_| {
             provider_error(ProviderErrorKind::Protocol, UpstreamSendState::Sent)
         })?;
         yield ProviderEvent::wire(wire);
@@ -874,7 +866,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 error,
             );
         }
-        let response = response.map_err(map_handshake_attempt_error);
+        let response = response.map_err(|error| map_handshake_attempt_error(error, &active_account));
         let response = match response {
             Ok(response) => response,
             Err(mut failure) => {
@@ -901,7 +893,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 }
                 apply_failure(&failure_context, &active_account, &failure)
                 .await;
-                Err(quota_continuation_replay_error(
+                Err(continuation_recovery_error(
                     failure.error,
                     &request,
                     ReplayBoundary::BeforeSemanticOutput,
@@ -921,6 +913,8 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             return;
         }
         if let Some(capture) = session_capture.as_mut() {
+            capture.oversized_http = response.transport_metrics.decision
+                == Some(CodexTransportDecision::Http2WebSocketMessageTooLarge);
             capture.continuation_scope = Some(if capture.response_store {
                 OpenAiContinuationScope::Persisted
             } else if response.transport == CodexBackendTransport::WebSocket
@@ -930,7 +924,6 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             } else {
                 OpenAiContinuationScope::ReplayRequired
             });
-            capture.turn_state = response.turn_state.clone().or(capture.turn_state.clone());
         }
         let mut observation_state = OpenAiResponseObservationState::from_backend_response(
             &response,
@@ -940,7 +933,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             yield ProviderEvent::observation(observation);
         }
         if let Some(etag) = response.response_metadata.models_etag.as_deref()
-            && let Err(error) = catalog.observe_response_etag(etag)
+            && let Err(error) = catalog.observe_response_etag(&active_account,etag)
         {
             tracing::warn!(
                 error = %error,
@@ -1016,6 +1009,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                         &quota,
                         &active_account,
                         passive_quota_observation.rate_limits(),
+                        decoder.semantic_output_seen(),
                     )
                     .await;
                 }
@@ -1061,7 +1055,6 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     };
                     let metadata_merge = merge_response_metadata_updates(
                         response_metadata_updates.as_ref(),
-                        &mut session_capture,
                         &mut observation_state,
                     )
                     .await;
@@ -1100,12 +1093,13 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                             &quota,
                             &active_account,
                             passive_quota_observation.rate_limits(),
+                            decoder.semantic_output_seen(),
                         )
                         .await;
                     }
                     apply_failure(&failure_context, &active_account, &failure)
                     .await;
-                    Err(quota_continuation_replay_error(
+                    Err(continuation_recovery_error(
                         failure.error,
                         &request,
                         ReplayBoundary::from_semantic_output(client_events.replay_closed()),
@@ -1138,7 +1132,6 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             };
             let metadata_merge = merge_response_metadata_updates(
                 response_metadata_updates.as_ref(),
-                &mut session_capture,
                 &mut observation_state,
             )
             .await;
@@ -1204,6 +1197,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     &quota,
                     &active_account,
                     passive_quota_observation.rate_limits(),
+                    completed && terminal_failure.is_none() || decoder.semantic_output_seen(),
                 )
                 .await;
                 trace.record("provider.quota_sync", json!({
@@ -1226,13 +1220,6 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     .record_success(&active_account)
                     .await;
                 trace.record("provider.account_success", json!({
-                    "durationMs": started.elapsed().as_millis(),
-                }));
-                let started = Instant::now();
-                selector
-                    .observe_cyber_policy_success(cyber_policy_scope.as_ref())
-                    .await;
-                trace.record("provider.cyber_policy_success", json!({
                     "durationMs": started.elapsed().as_millis(),
                 }));
             }
@@ -1260,7 +1247,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                         .error
                         .with_atomic_client_events(events);
                 }
-                Err(quota_continuation_replay_error(
+                Err(continuation_recovery_error(
                     failure.error,
                     &request,
                     ReplayBoundary::from_semantic_output(failure_after_commit),
@@ -1324,11 +1311,16 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             passive_quota_observation.observe(&updates);
             observation_state.merge_rate_limit_headers(&rate_limit_update_headers(&updates))
         };
+        let completed = events
+            .iter()
+            .flat_map(ProviderEvent::canonical_facts)
+            .any(|event| matches!(event, GatewayEvent::Completed(_)));
         if allows_account_state_mutation {
             synchronize_passive_quota(
                 &quota,
                 &active_account,
                 passive_quota_observation.rate_limits(),
+                completed && terminal_failure.is_none() || decoder.semantic_output_seen(),
             )
             .await;
         }
@@ -1338,16 +1330,11 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         }
         let metadata_changed = merge_response_metadata_updates(
             response_metadata_updates.as_ref(),
-            &mut session_capture,
             &mut observation_state,
         )
         .await
         .unwrap_or(false);
         attach_openai_session_update(&mut events, &mut session_capture);
-        let completed = events
-            .iter()
-            .flat_map(ProviderEvent::canonical_facts)
-            .any(|event| matches!(event, GatewayEvent::Completed(_)));
         let terminal_changed = completed
             && observation_state.mark_completed(terminal_response_is_incomplete(&events));
         if response_transport == CodexBackendTransport::WebSocket
@@ -1360,9 +1347,6 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             // 尾部 finish() 也可能产出 completed，账号健康更新先于下游 yield
             selector
                 .record_success(&active_account)
-                .await;
-            selector
-                .observe_cyber_policy_success(cyber_policy_scope.as_ref())
                 .await;
         }
         if (service_tier_changed
@@ -1389,7 +1373,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     .error
                     .with_atomic_client_events(events);
             }
-            Err(quota_continuation_replay_error(
+            Err(continuation_recovery_error(
                 failure.error,
                 &request,
                 ReplayBoundary::from_semantic_output(failure_after_commit),
@@ -1405,12 +1389,8 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
 
 async fn merge_response_metadata_updates(
     updates: Option<&CodexResponseMetadataUpdates>,
-    session_capture: &mut Option<OpenAiSessionCapture>,
     observation_state: &mut OpenAiResponseObservationState,
 ) -> Option<bool> {
     let turn_state = updates?.lock().await.turn_state.take()?;
-    if let Some(capture) = session_capture.as_mut() {
-        capture.turn_state = Some(turn_state.clone());
-    }
     Some(observation_state.merge_client_header("x-codex-turn-state", &turn_state))
 }

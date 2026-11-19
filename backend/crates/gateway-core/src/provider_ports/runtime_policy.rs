@@ -5,6 +5,14 @@ use crate::{account::OpaqueProviderData, identity::ProviderKind, routing::Config
 use futures::future::BoxFuture;
 
 pub trait ProviderRuntimePolicyPort: Send + Sync {
+    /// 后台模型操作读取 Provider 全局画像，不读取单个 Client Key 的覆盖
+    fn load_request_profile<'a>(
+        &'a self,
+        _provider: &'a ProviderKind,
+    ) -> BoxFuture<'a, Result<Option<OpaqueProviderData>, ProviderStoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// 原子推进预热执行游标，重启或时钟回拨后不重复领取已消费的时刻
     fn claim_warmup_slot<'a>(
         &'a self,
@@ -52,39 +60,28 @@ pub trait ProviderRuntimePolicyPort: Send + Sync {
     }
 }
 
-/// 校验每日预激活时间格式，如 "08:00" 或 "08:00,13:00"
+/// 校验单条五段 Cron 表达式
 #[must_use]
-pub fn valid_warmup_schedule_time(value: &str) -> bool {
-    if value.is_empty()
-        || value.len() > 255
+pub fn valid_warmup_cron(value: &str) -> bool {
+    parse_warmup_cron(value).is_some()
+}
+
+fn parse_warmup_cron(value: &str) -> Option<cron::Schedule> {
+    if value.len() > 255
         || value != value.trim()
         || value.chars().any(char::is_control)
+        || value.split_whitespace().count() != 5
     {
-        return false;
+        return None;
     }
-    for part in value.split(',') {
-        let bytes = part.as_bytes();
-        if bytes.len() != 5 || bytes[2] != b':' {
-            return false;
-        }
-        let Ok(hour) = part[0..2].parse::<u32>() else {
-            return false;
-        };
-        let Ok(minute) = part[3..5].parse::<u32>() else {
-            return false;
-        };
-        if hour > 23 || minute > 59 {
-            return false;
-        }
-    }
-    true
+    format!("0 {value}").parse().ok()
 }
 
 /// 账号模型预激活（预热）策略；来源于 `runtime_settings`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderWarmupPolicy {
     enabled: bool,
-    schedule_time: String,
+    schedules: Vec<cron::Schedule>,
     model: Option<String>,
 }
 
@@ -92,32 +89,50 @@ impl ProviderWarmupPolicy {
     /// 保存设置与创建预热策略使用相同的时间表和模型约束
     pub fn validate_values(
         enabled: bool,
-        schedule_time: &str,
+        cron: &str,
         model: Option<&str>,
     ) -> Result<(), &'static str> {
-        if !valid_warmup_schedule_time(schedule_time) {
-            return Err("account_warmup_schedule_time");
+        Self::validate_and_parse(enabled, cron, model).map(|_| ())
+    }
+
+    fn validate_and_parse(
+        enabled: bool,
+        cron: &str,
+        model: Option<&str>,
+    ) -> Result<Vec<cron::Schedule>, &'static str> {
+        if cron.len() > 255 || (enabled && cron.is_empty()) {
+            return Err("account_warmup_cron");
         }
+        // 分号分隔独立表达式，逗号保留给 Cron 字段内的列表
+        let schedules = if cron.is_empty() {
+            Vec::new()
+        } else {
+            cron.split(';')
+                .map(parse_warmup_cron)
+                .collect::<Option<Vec<_>>>()
+                .ok_or("account_warmup_cron")?
+        };
         if (enabled && model.is_none()) || !valid_optional_probe_model(model) {
             return Err("account_warmup_model");
         }
-        Ok(())
+        Ok(schedules)
     }
 
     pub fn try_new(
         enabled: bool,
-        schedule_time: String,
+        cron: &str,
         model: Option<String>,
     ) -> Result<Self, ProviderStoreError> {
-        if Self::validate_values(enabled, &schedule_time, model.as_deref()).is_err() {
-            return Err(ProviderStoreError::new(
-                ProviderStoreErrorKind::InvalidData,
-                "validate warmup policy",
-            ));
-        }
+        let schedules =
+            Self::validate_and_parse(enabled, cron, model.as_deref()).map_err(|_| {
+                ProviderStoreError::new(
+                    ProviderStoreErrorKind::InvalidData,
+                    "validate warmup policy",
+                )
+            })?;
         Ok(Self {
             enabled,
-            schedule_time,
+            schedules,
             model,
         })
     }
@@ -126,7 +141,7 @@ impl ProviderWarmupPolicy {
     pub const fn disabled() -> Self {
         Self {
             enabled: false,
-            schedule_time: String::new(),
+            schedules: Vec::new(),
             model: None,
         }
     }
@@ -137,28 +152,17 @@ impl ProviderWarmupPolicy {
     }
 
     #[must_use]
-    pub fn schedule_time(&self) -> &str {
-        &self.schedule_time
-    }
-
-    #[must_use]
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
 
-    /// 解析每日时间列表，返回如 `vec![(8, 0)]`
+    /// 匹配部署时区中的整分钟时刻，时区重叠及执行去重由 Worker 与存储端口负责
     #[must_use]
-    pub fn scheduled_times(&self) -> Vec<(u32, u32)> {
-        self.schedule_time
-            .split(',')
-            .filter_map(|part| {
-                let part = part.trim();
-                let mut iter = part.split(':');
-                let hour = iter.next()?.parse::<u32>().ok()?;
-                let minute = iter.next()?.parse::<u32>().ok()?;
-                Some((hour, minute))
-            })
-            .collect()
+    pub fn matches_slot(&self, slot: chrono::NaiveDateTime) -> bool {
+        let instant = slot.and_utc();
+        self.schedules
+            .iter()
+            .any(|schedule| schedule.includes(instant))
     }
 }
 

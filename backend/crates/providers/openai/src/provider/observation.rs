@@ -5,7 +5,7 @@ use super::*;
 pub(super) fn endpoint_requested_model(
     payload: &gateway_core::operation::RawJsonPayload,
 ) -> Option<gateway_core::routing::PublicModelId> {
-    if payload.protocol() != PROVIDER_NAME {
+    if payload.protocol() != OPENAI_PROTOCOL {
         return None;
     }
     // 选号与观测共用模型提取，跳过编辑请求中的图片且不改写原始正文
@@ -533,12 +533,13 @@ pub(super) async fn synchronize_passive_quota(
     quota: &CodexCredentialQuotaService,
     account: &ProviderAccount,
     rate_limits: &[ParsedRateLimits],
+    request_used_quota: bool,
 ) {
     if rate_limits.is_empty() {
         return;
     }
     if let Err(error) = quota
-        .synchronize_passive_rate_limits(account, rate_limits)
+        .synchronize_passive_rate_limits_with_usage(account, rate_limits, request_used_quota)
         .await
     {
         tracing::warn!(
@@ -554,6 +555,7 @@ pub(super) async fn synchronize_passive_quota_headers(
     account: &ProviderAccount,
     headers: &[(String, String)],
     image_endpoint: bool,
+    request_used_quota: bool,
 ) {
     let parsed = if image_endpoint {
         gateway_protocol::openai::events::parse_image_rate_limit_headers(headers)
@@ -561,7 +563,13 @@ pub(super) async fn synchronize_passive_quota_headers(
         parse_rate_limit_headers(headers)
     };
     if let Some(rate_limits) = parsed {
-        synchronize_passive_quota(quota, account, std::slice::from_ref(&rate_limits)).await;
+        synchronize_passive_quota(
+            quota,
+            account,
+            std::slice::from_ref(&rate_limits),
+            request_used_quota,
+        )
+        .await;
     }
 }
 
@@ -580,8 +588,11 @@ pub(super) fn nonnegative_millis(value: Option<i64>) -> Option<u64> {
 pub(super) fn compile_model_capabilities(model: &CodexCatalogModel) -> ProviderModelCapabilities {
     // 模型进入目录即可发布 Generate 能力，`supported_in_api` 仅作提示
     // 普通请求和诊断请求均以上游响应为准
-    let capabilities = ModelCapabilities::new(BTreeSet::from([OperationKind::Generate]), None)
-        .with_upstream_feature_validation();
+    let capabilities = ModelCapabilities::new(
+        BTreeSet::from([OperationKind::Generate, OperationKind::CountTokens]),
+        None,
+    )
+    .with_upstream_feature_validation();
     ProviderModelCapabilities::new(model.request_model().clone(), capabilities)
         .with_presentation(codex_model_presentation(model))
 }
@@ -690,8 +701,6 @@ pub(super) fn codex_request_context<'a>(
         request_id,
         turn_state: request.turn_state.as_deref(),
         turn_metadata: request.turn_metadata.as_deref(),
-        beta_features: request.beta_features.as_deref(),
-        include_timing_metrics: request.include_timing_metrics.as_deref(),
         version: request.version.as_deref(),
         codex_window_id: request.codex_window_id.as_deref(),
         parent_thread_id: request.parent_thread_id.as_deref(),
@@ -700,7 +709,6 @@ pub(super) fn codex_request_context<'a>(
         session_id: request.client_session_id.as_deref(),
         thread_id: request.client_thread_id.as_deref(),
         client_request_id: request.client_request_id.as_deref(),
-        turn_id: request.client_turn_id.as_deref(),
         account_selection,
     }
 }
@@ -807,6 +815,15 @@ fn selection_failure(error: &CredentialSelectionError) -> ProviderError {
         CredentialSelectionError::QueueRejected(error) => {
             provider_error(error.provider_kind(), UpstreamSendState::NotSent)
         }
+        CredentialSelectionError::IneligibleSessionAccountTimeout(_) => provider_error(
+            ProviderErrorKind::ConcurrencyQueueTimeout,
+            UpstreamSendState::NotSent,
+        )
+        .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+            error.to_string(),
+            None,
+            None,
+        )),
         CredentialSelectionError::CapacityUnavailable { retry_after } => {
             let error = provider_error(
                 ProviderErrorKind::AccountCapacityUnavailable,

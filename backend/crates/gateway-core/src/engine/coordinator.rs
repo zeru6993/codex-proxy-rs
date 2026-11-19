@@ -367,6 +367,7 @@ where
             account_rotations: 0,
             candidate_index,
             excluded_accounts: BTreeSet::new(),
+            excluded_proxy_endpoints: Vec::new(),
             credential_recovery_attempted_accounts: BTreeSet::new(),
             recovery_account: None,
             pending_retry: None,
@@ -525,6 +526,7 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     account_rotations: u32,
     candidate_index: usize,
     excluded_accounts: BTreeSet<crate::account::ProviderAccountId>,
+    excluded_proxy_endpoints: Vec<crate::upstream::ProxyEndpoint>,
     credential_recovery_attempted_accounts: BTreeSet<crate::account::ProviderAccountId>,
     /// 凭据恢复后的一次性同账号钉选；只约束紧随其后的 replay attempt，
     /// attempt 建立时即被消费，后续可重试错误仍可换号消耗剩余重试预算
@@ -1019,6 +1021,10 @@ where
         }
     }
 
+    fn has_account_rotation_budget(&self) -> bool {
+        self.account_rotations < self.plan.account_selection_policy().max_account_rotations()
+    }
+
     async fn prepare_attempt(&mut self) -> Result<Option<PullOutcome>, EngineError> {
         let pending_retry = self.pending_retry.take();
         let is_transport_recovery = pending_retry
@@ -1094,7 +1100,7 @@ where
                 ),
             }
         };
-        let account_context = match &self.account_selection {
+        let mut account_context = match &self.account_selection {
             AccountSelection::Diagnostic(target) => AccountAttemptContext::diagnostic(
                 self.excluded_accounts.clone(),
                 target.clone(),
@@ -1111,6 +1117,9 @@ where
             self.credential_recovery_attempted_accounts
                 .contains(account)
         }));
+        account_context
+            .excluded_proxy_endpoints
+            .clone_from(&self.excluded_proxy_endpoints);
         let provider = self
             .engine
             .providers()
@@ -1230,9 +1239,23 @@ where
             }
             ProviderBoundary::Result(result) => match *result {
                 Ok(stream) => stream,
-                Err(error) => {
+                Err(mut error) => {
                     attempt_trace.record_provider_failure(&error);
+                    if self.continuation_attempt == ContinuationAttempt::RotateForClientReplay
+                        && error.continuation_recovery_disposition()
+                            == Some(ContinuationRecoveryDisposition::ClientReplayRequired)
+                        && let Some(original) = self.last_retryable_failure.take()
+                    {
+                        // 迁移只改变客户端恢复指令；失败分类、发送事实与运维正文仍属于原请求
+                        error = original.with_client_recovery_from(error);
+                        self.last_retryable_failure_events.clear();
+                    }
                     let connection_fallback = self.connection_rotation.is_some()
+                        && self
+                            .last_retryable_failure
+                            .as_ref()
+                            .and_then(ProviderError::unreachable_proxy)
+                            .is_none()
                         && !self.connection_budget.exhausted()
                         && !error.retry_is_prohibited()
                         && error.send_state() == UpstreamSendState::NotSent
@@ -1264,7 +1287,7 @@ where
                         )
                         // 跨 Provider 候选推进必然换号（账号行按 Provider 隔离），
                         // 预算耗尽后不再推进，交回容量类失败的原有终态语义。
-                        && self.account_rotations < self.plan.account_selection_policy().max_account_rotations()
+                        && self.has_account_rotation_budget()
                         && self.advance_provider_candidate();
                     let retryable = self
                         .apply_retry_policy(super::policy::RetryFacts {
@@ -1668,19 +1691,21 @@ where
             && self.routing_attempts < self.plan.max_attempts().get();
         // 只有尚未发送的逻辑请求进入新增策略；已有发送后安全恢复保持原有路由规则
         let connection_retry_requested = self.current_send_state() == UpstreamSendState::NotSent
-            && matches!(
-                error.pre_delivery_retry(),
-                Some(crate::error::PreDeliveryRetry::SameAccountConnectionRetry { .. })
-            );
-        // 服务器建议不可截短；超出请求冻结的上限后沿用安全换号或原错误出口
+            && self.continuation_attempt == ContinuationAttempt::None
+            && error.allows_connection_rotation();
+        // 服务器建议不可截短
+        // 超出上限，或上游拒绝继续重试当前账号时，跳过同账号等待
+        // 较短的 Retry-After 也直接沿用安全换号或原错误出口
         let retry_after_exceeds_limit = error
             .retry_after()
             .is_some_and(|delay| delay > self.plan.max_retry_after());
+        let same_account_retry_blocked = error.same_account_retry_blocked();
         // Provider 的有界同账号传输恢复是尽力重试策略，不要求把 Sent/Ambiguous
         // 改写成安全证明；外部副作用、取消、预算与下游提交仍由 Core 拦截
         let transport_recovery = match error.pre_delivery_retry() {
             Some(crate::error::PreDeliveryRetry::SameAccountConnectionRetry { transport })
-                if !execution_effect_observed
+                if !same_account_retry_blocked
+                    && !execution_effect_observed
                     && !self.connection_budget.exhausted()
                     && !self.replay_barrier_reached
                     && !self.delivery_pending
@@ -1698,7 +1723,8 @@ where
             Some(crate::error::PreDeliveryRetry::SameAccountTransportRetry {
                 retry_index,
                 delay,
-            }) if !retry_after_exceeds_limit
+            }) if !same_account_retry_blocked
+                && !retry_after_exceeds_limit
                 && !execution_effect_observed
                 && !self.connection_budget.exhausted()
                 && !self.replay_barrier_reached
@@ -1707,7 +1733,8 @@ where
                 Some((AttemptTransport::Retry(retry_index), delay))
             }
             Some(crate::error::PreDeliveryRetry::SameAccountTransportFallback)
-                if !retry_after_exceeds_limit
+                if !same_account_retry_blocked
+                    && !retry_after_exceeds_limit
                     && !execution_effect_observed
                     && !self.connection_budget.exhausted()
                     && !self.replay_barrier_reached
@@ -1723,9 +1750,8 @@ where
         let can_rotate_connection = connection_retry_requested
             && self.account_selection.required_account().is_none()
             && self.routing_attempts < self.plan.max_attempts().get()
-            && self.account_rotations
-                < self.plan.account_selection_policy().max_account_rotations();
-        // A 先恢复一次，再利用预留预算重选；重选继续走已有降级传输，避免 WS 抢占最后一次 opening
+            && self.has_account_rotation_budget();
+        // A 先恢复一次，再利用预留预算重选；下一次传输仍由 Provider 的恢复策略决定
         let connection_rotation = transport_recovery
             .filter(|_| can_rotate_connection && current.connection_rotation_reserved);
         let reserve_connection_rotation = can_rotate_connection
@@ -1754,7 +1780,11 @@ where
                 max_delay,
                 jitter,
                 ..
-            }) if ordinary_retry && !suppress_transient_retry && !retry_after_exceeds_limit => {
+            }) if !same_account_retry_blocked
+                && ordinary_retry
+                && !suppress_transient_retry
+                && !retry_after_exceeds_limit =>
+            {
                 let retries = self
                     .transient_retry_counts
                     .entry(current.metadata.provider_account_id().clone())
@@ -1776,7 +1806,8 @@ where
             }
             _ => None,
         };
-        let same_account_retry = !execution_effect_observed
+        let same_account_retry = !same_account_retry_blocked
+            && !execution_effect_observed
             && error.retries_same_account()
             && provider_proved_replay_safe
             && !self.replay_barrier_reached
@@ -1797,8 +1828,7 @@ where
             && !is_return_error_retry(&error)
             && transport_recovery.is_none()
             && (ordinary_retry || account_rotation_retry)
-            && self.account_rotations
-                < self.plan.account_selection_policy().max_account_rotations();
+            && self.has_account_rotation_budget();
         let retryable = !error.retry_is_prohibited()
             && (continuation_retry
                 || same_account_retry
@@ -1834,6 +1864,7 @@ where
             "reserveConnectionRotation": reserve_connection_rotation,
             "transientRetry": transient_retry.is_some(),
             "retryAfterExceeded": retry_after_exceeds_limit,
+            "sameAccountRetryBlocked": same_account_retry_blocked,
             "maxRetryAfterSeconds": self.plan.max_retry_after().as_secs(),
             "clientRetrySuppressed": suppress_transient_retry,
             "rotationRetry": rotation_retry, "accountRotations": self.account_rotations,
@@ -1916,7 +1947,7 @@ where
         let store = Arc::clone(self.engine.store());
         let request_id = self.request_id.clone();
         let persisted = self.request_persisted;
-        // 错误、账号 lease 与决策 future 都跨 next_event 的取消保留
+        // 错误、尝试记录与决策 future 都跨 next_event 的取消保留
         // 在持久化及策略回调完成前，不能再次拉流或建立新的 attempt
         self.current = Some(current);
         self.pending_stream_failure = Some(PendingStreamFailure {
@@ -1988,6 +2019,11 @@ where
                 }
                 StreamRetry::Pending(retry) => self.pending_retry = Some(retry),
                 StreamRetry::ConnectionRotation(retry) => {
+                    if let Some(endpoint) = pending.error.unreachable_proxy()
+                        && !self.excluded_proxy_endpoints.contains(endpoint)
+                    {
+                        self.excluded_proxy_endpoints.push(endpoint.clone());
+                    }
                     self.excluded_accounts.insert(retry.account.clone());
                     self.connection_rotation = Some(retry);
                 }
@@ -2174,6 +2210,26 @@ where
         }
 
         match self.continuation_attempt {
+            ContinuationAttempt::Native
+                if error.continuation_recovery_disposition()
+                    == Some(ContinuationRecoveryDisposition::ClientReplayRequired)
+                    && matches!(
+                        error.pre_delivery_retry(),
+                        Some(crate::error::PreDeliveryRetry::SameAccountTransientRetry {
+                            policy: crate::error::TransientRetryPolicy::RetryThenRotateAccount,
+                            ..
+                        })
+                    )
+                    && error
+                        .retry_after()
+                        .is_some_and(|delay| delay > self.plan.max_retry_after())
+                    && !error.retry_is_prohibited()
+                    && self.has_account_rotation_budget() =>
+            {
+                self.continuation_attempt = ContinuationAttempt::RotateForClientReplay;
+                self.excluded_accounts
+                    .insert(current.metadata.provider_account_id().clone());
+            }
             ContinuationAttempt::Native => match error.continuation_recovery_disposition() {
                 Some(ContinuationRecoveryDisposition::RetryExactConnection) => {
                     self.recovery_account = Some(current.metadata.provider_account_id().clone());
@@ -2197,8 +2253,7 @@ where
             // 两个排除臂都必然换号；预算耗尽后不再排除当前账号做跨账号续写重放，
             // 落回不可重试路径以原始上游错误终态。
             ContinuationAttempt::ReplayOwner | ContinuationAttempt::ReplayAny
-                if self.account_rotations
-                    >= self.plan.account_selection_policy().max_account_rotations() =>
+                if !self.has_account_rotation_budget() =>
             {
                 return false;
             }
@@ -2211,7 +2266,7 @@ where
                 self.excluded_accounts
                     .insert(current.metadata.provider_account_id().clone());
             }
-            ContinuationAttempt::None => return false,
+            ContinuationAttempt::None | ContinuationAttempt::RotateForClientReplay => return false,
         }
         true
     }
@@ -2250,7 +2305,7 @@ where
             return false;
         }
         // Native 期间仍可能配置为禁止换号，跨账号重放共用请求冻结的预算
-        if self.account_rotations >= self.plan.account_selection_policy().max_account_rotations() {
+        if !self.has_account_rotation_budget() {
             return false;
         }
 
@@ -2385,6 +2440,9 @@ where
     }
 
     async fn finish_interruption(&mut self, error: &EngineError) -> Result<(), EngineError> {
+        if let Some(current) = self.current.as_mut() {
+            current.stream.abort();
+        }
         // 结算 I/O 可能继续等待，先冻结交付事实以保持终态与实际 HTTP 状态一致
         self.response_commit.finish();
         let (outcome, gateway_error) = match error {

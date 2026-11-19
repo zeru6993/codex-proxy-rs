@@ -17,11 +17,15 @@
 /.runtime/
 *.log
 
+# Local planning documents
+/docs/plans/
+
 # Local configuration and secrets
 /deploy/config.yaml
 .env
 .env.*
 !.env.example
+!/frontend/.env
 
 # Editors and operating systems
 /.idea/

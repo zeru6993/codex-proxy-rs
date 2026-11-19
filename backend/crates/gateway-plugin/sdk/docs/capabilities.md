@@ -89,6 +89,7 @@ Provider 固定为宿主内置的 OpenAI 与 xAI。宿主开放以下 11 类扩�
 | `call.host.quota_details(query)` | `host.data.quota.details` | `QuotaFactsQuery { account_id }`：读取完整额度事实，包含窗口归属、触顶和点数 |
 | `call.host.check_access(query)` | `host.data.access.check` | `AccessQuery { client_key_id, account_ids, upstream_model }`：读取 Key 对指定账号及可选上游模型的冻结授权 |
 | `call.host.verify_client(request)` | `host.client.verify` | `VerifyClientRequest { authorization }`：复用入口认证，返回 `VerifiedClient { client_key_id }` |
+| `call.host.quota_history(query)` | `host.data.quota.history` | 按账号、窗口键和时间范围分页读取已保留的额度观测 |
 | `call.host.quota_facts(query)` | `host.data.quota.get` | `QuotaFactsQuery { account_id }`：读取 Provider 现有观测，不访问上游刷新 |
 | `call.host.key_facts(query)` | `host.data.keys.get` | `ClientKeyFactsQuery { client_key_id }`：读取当前 Key 的启用状态及显式分组 ID，不返回密钥 |
 
@@ -107,6 +108,16 @@ SDK 解析响应时忽略未知字段，包含账号分页、账号及额度窗�
 
 `quota_details` 保留 Provider 已解释的 `limit_reached`、窗口 `group`、`label`、`limit_id`、`limit_name`、`role`
 及点数 `has_credits`、`unlimited`、`balance`；缺失值仍为 `null`，不返回上游原始文档，不发起刷新
+
+`quota_history(QuotaHistoryQuery { account_id, window_key, start_ms, end_ms, cursor })` 按请求完成时间倒序返回
+`[start_ms, end_ms)` 内的同桶读数。窗口键与 `quota_details` 相同，区间最长 366 天。每个样本包含
+`observed_at_ms`、`used_percent` 和当时观测到的 `reset_at_ms`、`plan_type`，后两项可为 `null`。
+首次省略游标；即使 `samples` 为空，只要有 `next_cursor` 就沿用原查询继续。末页的 `baseline` 是起点前最近的同桶读数，
+最多向前查一个等长区间。例如查最近 48 小时，基线最多再向前找 48 小时；没有基线时返回 `null`
+
+历史来自保留的已结束请求，不含独立额度刷新。Provider 未提供可解析的同桶观测时没有样本。
+缺样不代表零；跨重置或套餐变更不能直接相减。这是观测记录，不是精确消耗账本。
+分页不冻结数据，长区间建议在后台读取并复用结果
 
 `verify_client` 使用当前请求设置和原认证计划，包含外部 principal 到 Key 的映射；没有 HTTP 入口时使用当前发布配置。
 认证可以调用认证插件，继续扣减父预算并响应取消；验证成功不做推理准入、账号租约、使用记录或计费。
@@ -184,7 +195,7 @@ Key 明文仍通过宿主管理面查看，插件模型调用使用返回的 Key
 
 ### Client Key 预算
 
-预算接口可查询、设置日／周金额上限及清零全部 Client Key 的当前周期用量，包括管理员和其他插件创建的 Key
+预算接口可查询和修改全部 Client Key 的日／周金额上限、用量与窗口，包括管理员和其他插件创建的 Key
 
 类型位于 `call::key_budgets`；下列预算方法控制参数为 `{}`，输入输出为二进制 JSON：
 
@@ -193,32 +204,51 @@ Key 明文仍通过宿主管理面查看，插件模型调用使用返回的 Key
 | `get_key_budget` / `host.keys.get_budget` | `{client_key_id}`；返回 `KeyBudget`，包含 ID、日／周上限及已用金额、日／周重置时间 |
 | `update_key_budget_limits` / `host.keys.update_budget_limits` | `{client_key_id, daily_limit_usd?, weekly_limit_usd?}`；至少指定一项；返回 `{client_key_id}` |
 | `reset_key_budget` / `host.keys.reset_budget` | `{client_key_id, period}`；`period` 必填，取 `daily`、`weekly` 或 `all`；返回 `{client_key_id}` |
+| `get_key_budget_window` / `host.keys.get_budget_window` | `{client_key_id, period}`；`period` 为 `daily` 或 `weekly`；返回 `{revision, explicit, starts_at_us, ends_at_us, used_usd}` |
+| `set_key_budget_window` / `host.keys.set_budget_window` | `{client_key_id, period, expected_revision, window}`；返回 `{revision}` |
 
 `list_keys` / `host.keys.list` 仍可查询非秘密目录，仅返回 `{id,name,enabled}` 和游标，沿用目录的控制参数编码。
 上述操作均接受 Key ID，不接受 Key 明文，也不要求先查询目录
 
 金额为非负十进制字符串，沿用原生金额精度；上限 `"0"` 表示不限。`KeyBudget` 的字段为
 `daily_limit_usd`、`weekly_limit_usd`、`daily_used_usd`、`weekly_used_usd`、`daily_resets_at_ms`、`weekly_resets_at_ms`；
-时间为 UTC Unix 毫秒，`null` 表示尚未使用或窗口已过期。读取不触发准入、开启窗口或清零，停用的 Key 仍可管理
+时间为 UTC Unix 毫秒，原生窗口尚未开启或已过期时返回 `null`；显式窗口到期后仍保留金额与结束时间。
+读取不触发准入、开启窗口或清零，停用的 Key 仍可管理
 
 上限更新仅写入提供的日／周金额；省略或 `null` 的项保持不变。它保留已用金额、窗口到期时间、费用历史及其他 Key 配置。
 写入复用 Key 行锁，与结算串行；实际变化时实例版本复验、修改、配置 revision 和审计在同一事务提交，并通知原生配置发布。
 相同值再次赋值不产生新 revision 或审计；并发更新按事务顺序生效，同一字段由后提交的值覆盖，接口不提供调用去重或比较交换。
 将非零上限降低到已用金额及以下会拒绝后续准入，提高限额可恢复准入，在途请求仍按原生规则完成和结算
 
-重置清零所选周期并清除到期时间，保留额度上限、密钥和历史费用事件；所选窗口下次使用时按原生规则重新开启。
+重置清零所选周期、退出显式模式并清除到期时间，保留额度上限、密钥和历史费用事件；所选窗口下次使用时按原生规则重新开启。
 费用按完成时间归属，重置前完成但延迟落盘的费用不会重新扣入已重置周期，重置后完成的在途请求仍正常扣额。
-实例版本复验、清零和审计在同一事务提交，不推进配置 revision。每次调用均执行新重置，可能清掉两次调用之间的新消费
+实例版本复验、清零和审计在同一事务提交，推进窗口 revision，不推进配置 revision。每次调用均执行新重置，可能清掉两次调用之间的新消费
 
 SDK 不自动重试。超时或断连不能证明写入未提交；重试上限赋值也可能覆盖期间其他调用的修改。
 不存在的 Key 返回 `rejected`；写入事务复验发现实例停用或版本变化时返回 `conflict`，
 非法输入返回 `invalid_input`。账号关联、预算分配和重置触发由插件决定，宿主不自动串联上述接口
 
-插件的外部周期、截止时间和同步进度保存在自身 `host.state.*` 中，并通过自己的管理页面展示；
-这些数据不会改写宿主日／周窗口及其显示。插件可在 `request` 中间件中按自己的策略提前拒绝请求，
-在确认新周期后调用预算重置或上限修改接口；调用仍遵循上述原生语义，宿主窗口继续按自身日期规则滚动。
-私有状态写入与预算操作不是一个事务，不能把私有状态标记当作预算操作已提交的证明；结果未知时须按上述合同处理。
-停用插件会停止其后续拦截与同步，已执行的额度修改或重置不会自动撤销
+显式窗口的 `window` 为 `{starts_at_us, ends_at_us}`，两端均为 UTC Unix 微秒，采用左闭右开区间，起点须早于终点。
+接管已有窗口时，直接回传 `get_key_budget_window` 返回的微秒值；截断到毫秒可能改变窗口边界。
+设置窗口保留金额上限，并从原生费用事件计入区间内已完成请求；待落盘费用由现有准入和结算路径处理。
+窗口未开始或已到期时拒绝新请求，错误码为 `key_budget_window_inactive`，即使金额上限为零也不放行；
+宿主不按日历推进显式窗口。结算按完成时间归属，迟到费用不会计入其他周期。
+`window` 必填；传 `null` 退出显式模式并保留当前边界与消费。起点之前仍拒绝准入，到期后按原生规则继续
+
+业务备份不包含逐请求费用。若新边界需要缺失的费用历史，设置返回 `conflict`，原窗口不变。
+相同边界可以沿用已用金额；起点不早于完整费用历史的窗口可正常设置。新周期到来前无需清零
+
+`expected_revision` 来自窗口查询，作为该 Key 的操作标识。日／周控制操作共用窗口 revision，
+设置窗口或手动重置时递增，消费和日历滚动不推进。操作参数、窗口与审计在同一事务提交：
+
+- 最近一次提交以相同版本、调用来源与参数重试，返回已提交的 revision，不重复改金额或写审计
+- 同一版本换参数、较旧版本或尚不存在的版本均返回 `conflict`
+- 只保存最近操作的参数，不保存历史回包；新操作先读取当前窗口版本
+
+账号关联、观测新鲜度与周期判断由插件负责，宿主不推断账号周期，也不维护插件同步进度。
+插件在私有状态中保存完整待提交操作，再调用窗口接口；结果未知时保留原参数重试，收到冲突后由插件决定如何处理。
+私有状态与预算修改不是同一事务。停用插件不会撤销已设窗口，窗口到期后仍拒绝准入；
+可显式释放控制，或通过原生手动重置恢复日历规则
 
 ### Key、模型与模型调用
 
@@ -260,7 +290,7 @@ HTTP 和 request 中间件中的模型回调沿用有效请求设置；attempt�
 
 `HostClient::account_http(AccountHttpRequest { account_id, credential_revision, request }, body)` 使用指定账号的当前代理配置，
 经 `host.http.account` 返回同一 `HostHttpBody`。每次发送核对账号存在、启用和凭据版本，版本变化须由插件重新读取后决定下一步。
-请求 headers 与正文完全由插件提供；宿主不注入账号认证、不申请推理租约，代理不可用时直接失败，不回退直连。
+请求 headers 与正文完全由插件提供；宿主不注入账号认证、不申请推理租约。无显式代理时使用部署默认出口，代理不可用时直接失败，不回退直连。
 这项能力与上游适配器的账号推理 HTTP 分开，适用于插件自行构造的账号网络请求
 
 `HostClient::proxy_http(ProxyHttpRequest { proxy_id, request }, body)` 经 `host.http.proxy` 使用指定代理的当前配置，
@@ -337,10 +367,10 @@ HTTP 总入口统一包裹原生路由，`dispatch_http` 复用同一路由与�
 版本过期返回 `ServiceError { kind: "conflict", message }`。读取结果的普通改写不会持久化，也不会回滚已经提交的事务
 
 `accounts::GetResetCreditAutomation` 接收账号 ID，返回 `ResetCreditAutomationStatus`：开关、全局提前分钟数、
-下次发现与使用时间、最近结果；时间为 RFC 3339 字符串，无计划时为 `None`。
+生效的周额度触发值（临期模式为 `None`）、下次发现与使用时间、最近结果；时间为 RFC 3339 字符串，无计划时为 `None`。
 `accounts::SetResetCreditAutomation` 接收 `(account_id, enabled)`，返回保存后的同一状态；审计主体与调用标识由宿主提供。
-两者复用原生账号校验和自动重置用例，不立即查询或消费上游卡片。提前时间与剩余周额度上限通过 `settings::Load` / `Replace` 的
-`reset_credit_lead_minutes` 和可选的 `reset_credit_max_weekly_remaining_percent` 读取和设置，范围见[主动额度重置卡](../../../../../docs/api.md#主动额度重置卡)
+两者复用原生账号校验和自动重置用例，不立即查询或消费上游卡片。使用时机、提前时间与剩余周额度上限通过 `settings::Load` / `Replace` 的
+`reset_credit_on_low_weekly_quota`、`reset_credit_lead_minutes` 和可选的 `reset_credit_max_weekly_remaining_percent` 读取和设置，范围见[主动额度重置卡](../../../../../docs/api.md#主动额度重置卡)
 
 ```rust,ignore
 use gateway_plugin_sdk::call::services::accounts::{GetResetCreditAutomation, SetResetCreditAutomation};
@@ -430,6 +460,9 @@ Ping 的自动 Pong 与关闭握手属于底层 WebSocket 协议事实；插件�
 或 `WebSocket { uri }`，不能在准备过程中切换传输类型。HTTP 正文是已经序列化、完成内容编码的实际字节，
 插件自行处理压缩与 `Content-Encoding` 等头部的一致性；宿主不解码正文、补回字段或修复请求
 
+内置转发在出站准备前，仅为已识别的互联上游组装 `X-CPR-Route`，向普通模型上游剥离。
+插件改写目标或自行实现转发时，负责在互联节点间保留并维护路径，在最终模型上游前移除该头；宿主不在插件返回后重新判断或修复互联链路
+
 `OutboundCall.metadata` 提供真实请求、Client Key、分组、Provider、模型、账号与 attempt 序号。
 这些归属由宿主冻结，返回值只有请求；修改 URL、认证头或正文不改变账号租约、凭据版本与计费归属。
 宿主不从最终字节重建模型、选号或续接事实；需要改变这些业务含义时，插件应在相应的 request / attempt 阶段保持一致。
@@ -495,6 +528,9 @@ Chat 的下游流模式及 `include_usage` 由 API 持有，request 阶段不能
 同一边界的原样保留不要求 Chat 与 Responses 字节相同；需要读写 `messages` 或 `choices` 的插件应使用 HTTP 挂载，
 字段范围见 [Chat 合同](../../../../../docs/api.md#chat-completions-请求)
 
+Messages 入站的 `protocol` 为 `anthropic`，端点为 `/v1/messages`；计数使用 `/v1/messages/count_tokens` 与 `count_tokens` 操作
+同协议请求保留原生正文，Responses 与 Messages 之间的转换发生在所选上游的执行边界
+
 中间件可读取和改写完整请求、响应 headers、正文与响应帧，也不按字段名称过滤认证、Cookie、会话或连接头。
 该能力遵循[完整信任](manifest.md#完整信任)边界；类型、HTTP 格式、大小及资源生命周期仍需符合合同
 
@@ -516,7 +552,8 @@ Header 修改采用增量 remove/append，保留合法多值。`MiddlewareBody::
 这一保证比较插件前后的同一边界，Provider 自身的协议适配、两次调用的随机值和网络分段不在比较范围内
 
 `request.declare_capabilities(CapabilityDeclaration { handled, required })` 随单次 `next` 发出，必须同时显式替换正文。
-当前仅允许 OpenAI 生成请求的 request 阶段，HTTP 与 WebSocket 共用规则；不扩展端点允许的协议或流模式。
+当前仅允许 Responses 或 Messages 生成请求的 request 阶段，HTTP 与 WebSocket 共用规则；不扩展端点允许的协议或流模式。
+Responses 与 Messages 的功能声明均按各自协议正文重新提取事实，声明不能改变请求协议
 `handled` 只允许列举改写前确实存在、改写后已从实际请求移除的 `tools`、`vision`、`reasoning`、`json_schema`，
 插件须负责对应的提示词转换及普通响应、错误、流式响应还原。`required` 为额外上游需求，不能覆盖正文推导出的要求。
 重复项、同一项同时出现在两组、空声明、attempt 阶段使用声明均会拒绝。
@@ -627,8 +664,19 @@ middleware 的 `next` 最多调用一次，重试与额外模型执行通过独�
 ### 路由、调度与观察
 
 `policy.route_model` 和 `policy.schedule_account` 只提出决定，宿主随后复核 Key 规则、模型能力、账号资格和租约。
-`scheduler` 必须声明 `version: 3`。`candidates` 已按 Key 范围、模型权限、账号状态和原生续写绑定收窄，
+`scheduler` 必须声明 `version: 4`。`candidates` 已按 Key 范围、模型权限、账号状态和原生续写绑定收窄，
 同时包含暂时繁忙但可以等待的账号；`available` 表示本次可以立即尝试租约，不保证租约一定成功
+
+每个候选的 `session_bound` 表示它是否为 Provider 已查到的本次会话绑定账号。仅匹配缓存偏好不算会话绑定。`role` 表示本轮选号如何使用它：
+
+| `role` | 含义 |
+| --- | --- |
+| `ordinary` | 普通候选。宽松模式下已有绑定也可以是普通候选 |
+| `preferred` | 内置选号优先考虑，允许选择其他账号。xAI 的会话偏好由评分得出，不表示已有持久绑定 |
+| `follow_only` | 委托内置选号时只跟随这个绑定账号，插件仍可显式选择其他合格候选 |
+| `pinned` | 本次尝试已固定账号，例如原生续接；插件不能改选其他账号 |
+
+关系只标在本轮可见候选上，繁忙不抹去关系，候选中没有绑定标记也不能断定是新会话。角色不授予账号资格，不代表已取得租约
 
 - `Pick { account_id }` 显式选号，只能指定 `available: true` 的候选
 - `Delegate` 将完整候选交给宿主现有调度

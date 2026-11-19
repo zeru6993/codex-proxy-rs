@@ -150,6 +150,14 @@
       "unitLabel": "USD / 百萬 Token"
     },
     "scheduling": {
+      "runtimeGroup": "執行狀態",
+      "quotaGroup": "額度",
+      "queueGroup": "排隊",
+      "windowMode": "重置視窗係數",
+      "windowHelp": "係數越大，該窗口越影響重置評分，設為 0 可忽略該窗口",
+      "fiveHour": "5 小時",
+      "weekly": "週",
+      "monthly": "月",
       "roundRobin": "輪詢",
       "autoReviewSlotsHelp": "僅對 Codex 賬號生效，普通併發爲 10、審批名額爲 3 時，兩類請求分別最多運行 10 個和 3 個，互不佔用名額",
       "autoReviewQueueHelp": "開啓獨立額度後，審批請求單獨排隊，可超過賬號隊列容量，仍受總等待容量、排隊超時與密鑰限額約束",
@@ -169,7 +177,6 @@
       },
       "enterValueFromToUpToOne": "請輸入 0～10 的數值，最多一位小數",
       "description": "調整賬號選擇偏好",
-      "enabledHelp": "僅在啓用智能調度後生效",
       "about": "{label}說明",
       "zeroWeightHelp": "0 表示不參與評分",
       "weightsRequired": "至少一項係數需要大於 0"
@@ -198,15 +205,15 @@
     "warmup": {
       "title": "賬號預熱",
       "description": "嘗試啓動空閒 Codex OAuth 賬號的額度窗口",
-      "enableDailyWarmup": "啓用每日預熱",
-      "executionTime": "執行時間",
-      "timesPlaceholder": "HH:MM，多個時間用逗號分隔",
-      "scheduleLabel": "每日預熱時間",
+      "enableWarmup": "啟用預熱",
+      "cronExpression": "Cron 表達式",
+      "cronHelp": "按 Enter 新增 Tag，支援多個",
       "modelLabel": "預熱模型",
       "modelHelp": "啓用時必填，需爲賬號可用模型",
       "modelPlaceholder": "輸入模型名稱",
       "helpTitle": "賬號預熱說明",
-      "help": "在設定時間向每個空閒的 Codex OAuth 賬號發送一次請求，不保證額度窗口成功啓動"
+      "help": "向可用的 Codex OAuth 帳號傳送輕量請求，略過額度耗盡和已確認活躍的視窗，0% 帳號允許預熱，不保證視窗成功啟動",
+      "scheduleHelp": "依部署時區執行，同一分鐘只預熱一次"
     },
     "adminApiKey": {
       "adminApiKey": "管理員 API密鑰",
@@ -264,9 +271,10 @@
       "accountTimeout": "賬號排隊超時",
       "accountTimeoutHelp": "從首次進入賬號隊列起計時，重試不重置",
       "queueFailure": "賬號隊滿或超時後",
-      "queueFailureHelp": "嘗試換號時，改用有空位的賬號；無法換號則返回排隊錯誤",
+      "queueFailureHelp": "嘗試換到有空位的賬號，無法換號時返回排隊錯誤",
       "queueFailureHelpTitle": "賬號換號規則",
-      "queueFailureDetails": "只重新選擇一次，不再排隊。指定賬號、需要用原賬號續寫，或必須跟隨主會話的請求不能自行換號。",
+      "queueFailureAttempt": "只嘗試換號一次，不再排隊",
+      "queueFailureRestrictions": "指定賬號、需要原賬號續寫或必須跟隨主會話的請求不能自行換號",
       "returnError": "返回錯誤",
       "trySwitch": "嘗試換號",
       "autoReview": {
@@ -278,7 +286,9 @@
         "label": "上游重試等待上限",
         "help": "超限時嘗試換號",
         "helpTitle": "上游重試等待說明",
-        "details": "預設 240 秒，限制單次 Retry-After 等待，並非請求總時長。超限時嘗試換號，無可用賬號則返回錯誤。0 表示不接受正數等待。換號仍受最大換號次數和請求可重試條件限制。"
+        "waitLimit": "預設 240 秒，僅限制單次 Retry-After 等待，不限制請求總時長",
+        "zeroLimit": "設為 0 時，任何大於 0 秒的等待都算超限",
+        "switchConditions": "超限後，僅在請求可重試且未達到最大換號次數時嘗試換號，無可用賬號則返回錯誤"
       }
     },
     "modelMapping": "模型映射",
@@ -298,7 +308,7 @@
       "retentionDaysLabel": "歷史保留天數"
     },
     "retentionDays": "保留天數",
-    "enterDays": "請輸入 1–31 天",
+    "enterDays": "請輸入保留天數",
     "day": "天",
     "location": {
       "requestLocationOverride": "請求位置覆蓋",
@@ -308,7 +318,11 @@
     "quotaReset": {
       "title": "主動重置卡",
       "enableHelp": "在賬號的「額度重置」中開啓自動使用",
-      "description": "全局設置，對已開啓自動使用的賬號生效",
+      "description": "到期前多久使用重置卡",
+      "timing": "使用時機",
+      "expiryMode": "臨期使用",
+      "weeklyMode": "按週額度使用",
+      "earlyThresholdHelp": "剩餘比例不高於此值時使用，留空或填 0 表示耗盡時使用",
       "thresholdHelp": "高於此值時暫不自動使用，留空表示不限制",
       "weeklyQuotaLimit": "重置卡剩餘周額度上限"
     },
@@ -328,12 +342,13 @@
       "smartSchedulingSettings": "智能調度設置",
       "smartLabel": "智能調度",
       "smartDescription": "綜合負載、剩餘額度、健康和延遲評分，支持自定義評分偏好",
-      "quotaResetLabel": "額度重置優先",
+      "quotaResetLabel": "額度調度",
       "quotaResetDescription": "優先選擇額度窗口更快重置的賬號，適合在重置前消耗剩餘額度",
       "roundRobinLabel": "輪詢調度",
       "roundRobinDescription": "在可用候選賬號間按順序輪轉，分配結果最可預測",
       "stickyLabel": "粘性調度",
-      "stickyDescription": "優先複用最近使用的賬號，直到不可用後再切換"
+      "stickyDescription": "優先複用最近使用的賬號，直到不可用後再切換",
+      "quotaResetPrioritySettings": "額度調度設置"
     },
     "access": {
       "accessRestrictions": "訪問限制",
@@ -611,10 +626,11 @@
       "invalidBodyLimit": "Responses 解壓上限應爲有效的正整數（MiB）",
       "invalidQuotaThreshold": "剩餘周額度上限應爲 0～100 的整數，留空表示不限制",
       "invalidResetLeadTime": "重置卡提前使用時間應爲 1～1440 分鐘的整數",
-      "invalidRetention": "歷史保留天數應爲 1–31 的整數",
+      "invalidRetention": "歷史保留天數應爲正整數",
       "invalidQueueSettings": "隊列容量應爲 0～1000 的整數，排隊超時應爲 1～120 秒的整數",
       "invalidProbeModel": "探測模型最多 128 個字符，不能包含控制字符",
-      "invalidWarmupTimes": "預激活時間格式無效，請輸入 HH:MM 格式（如 08:00 或 08:00,13:00）",
+      "invalidWarmupCron": "請輸入有效的 Cron 表達式",
+      "warmupCronTooLong": "總長度不可超過 255 位元組",
       "warmupModelRequired": "啓用預激活時請選擇模型",
       "invalidWarmupModel": "預激活模型名稱不能超過 128 個字符",
       "settingsSaved": "設置已保存",
@@ -718,6 +734,10 @@
       "moreValues": "{values} 或其他 {count} 項",
       "messageHelp": "包含匹配檢查錯誤信息的前 8 KiB，保留完整字符，等值匹配比較完整信息，超長信息不會被視爲字段缺失",
       "limitsHelp": "最多 32 條規則，每條 8 個條件，每個條件 16 個候選值，所有規則文本與探測模型合計不超過 64 KiB UTF-8"
+    },
+    "resetPriority": {
+      "description": "按所選視窗的重置時間和係數排序",
+      "windowHelp": "係數決定各視窗的相對占比，0 表示忽略該視窗，全部為 0 時按最近的有效重置時間排序"
     }
   }
 }

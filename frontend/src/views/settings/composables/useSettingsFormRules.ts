@@ -9,7 +9,7 @@ type SettingsForm = ReturnType<typeof useSettingsForm>['form']
 
 export function useSettingsFormRules(form: () => SettingsForm) {
   const { t } = useI18n({ useScope: 'global' })
-  const integer = (min: number, max: number, message: string): FormRule => ({
+  const integer = (min: number, max: number | undefined, message: string): FormRule => ({
     type: 'integer',
     required: true,
     min,
@@ -47,16 +47,22 @@ export function useSettingsFormRules(form: () => SettingsForm) {
       ...integer(0, 100, t('settings.form.invalidQuotaThreshold')),
       required: false,
     },
-    'usageRetentionDays': integer(1, 31, t('settings.form.invalidRetention')),
+    'usageRetentionDays': integer(1, undefined, t('settings.form.invalidRetention')),
     'minCodexDesktopVersion': version(),
     'minCodexCliVersion': version(),
-    'accountWarmupScheduleTime': {
-      required: true,
-      pattern: /^(?:[01]\d|2[0-3]):[0-5]\d(?:,(?:[01]\d|2[0-3]):[0-5]\d)*$/,
-      transform: value => value.trim(),
-      trigger: ['blur', 'change'],
-      message: t('settings.form.invalidWarmupTimes'),
-    },
+    'accountWarmupCron': [
+      {
+        validator: (_rule, expressions: string[]) => (!form().accountWarmupEnabled || expressions.length > 0)
+          && expressions.every(expression => /^[^\s;]+(?: +[^\s;]+){4}$/u.test(expression)),
+        message: t('settings.form.invalidWarmupCron'),
+        trigger: ['blur', 'change'],
+      },
+      {
+        validator: (_rule, expressions: string[]) => new TextEncoder().encode(expressions.join(';')).length <= 255,
+        message: t('settings.form.warmupCronTooLong'),
+        trigger: ['blur', 'change'],
+      },
+    ],
     'accountWarmupModel': [
       {
         required: form().accountWarmupEnabled,

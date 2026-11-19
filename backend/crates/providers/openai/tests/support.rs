@@ -19,12 +19,12 @@ use gateway_core::account::{
 use gateway_core::error::{StoreError, StoreErrorKind};
 use gateway_core::policy::ClientApiKeyId;
 use gateway_core::provider_ports::{
-    ProviderCatalogCacheKey, ProviderCatalogCachePort, ProviderCooldown, ProviderCooldownPort,
-    ProviderCooldownScope, ProviderLeaseAcquisition, ProviderLeasePort, ProviderLeaseRequest,
-    ProviderRefreshPolicy, ProviderRuntimePolicyPort, ProviderSchedulingLeaseRequest,
-    ProviderSchedulingState, ProviderScopedCooldown, ProviderSessionAffinityKey,
-    ProviderSessionAffinityPort, ProviderSessionExclusionPort, ProviderSessionExclusions,
-    ProviderStoreError,
+    ProviderAccountAdmission, ProviderCatalogCacheKey, ProviderCatalogCachePort, ProviderCooldown,
+    ProviderCooldownPort, ProviderCooldownScope, ProviderLeaseAcquisition, ProviderLeasePort,
+    ProviderLeaseRequest, ProviderRefreshPolicy, ProviderRuntimePolicyPort,
+    ProviderSchedulingLeaseRequest, ProviderSchedulingState, ProviderScopedCooldown,
+    ProviderSessionAffinityKey, ProviderSessionAffinityPort, ProviderSessionBinding,
+    ProviderSessionExclusionPort, ProviderSessionExclusions, ProviderStoreError,
 };
 use gateway_core::routing::ProviderKind;
 use provider_openai::credential::{
@@ -32,6 +32,7 @@ use provider_openai::credential::{
     ImportCodexOAuthCredential,
 };
 use secrecy::SecretString;
+use tokio::sync::oneshot;
 
 #[derive(Clone)]
 struct StoredAccount {
@@ -51,15 +52,42 @@ type CredentialLoadHook = dyn for<'a> Fn(
 
 #[derive(Default)]
 pub(crate) struct MemoryAccountStore {
+    pub(crate) peer_discovered: AtomicBool,
     accounts: Mutex<BTreeMap<ProviderAccountId, StoredAccount>>,
+    warmup_states: Mutex<BTreeMap<ProviderAccountId, gateway_core::account::QuotaWarmupState>>,
+    catalogs: Mutex<
+        BTreeMap<
+            ProviderAccountId,
+            (
+                gateway_core::account::AccountCatalogObservation,
+                bytes::Bytes,
+            ),
+        >,
+    >,
     account_reads: AtomicUsize,
     provider_list_reads: AtomicUsize,
     quota_reads: AtomicUsize,
+    next_quota_read: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     largest_quota_read: AtomicUsize,
     fail_provider_listing: AtomicBool,
     pending_account_reads: bool,
     credential_load_hook: Mutex<Option<Arc<CredentialLoadHook>>>,
     credential_loads: AtomicUsize,
+}
+
+impl gateway_core::account::UpstreamInfoSource for MemoryAccountStore {
+    fn is_peer(&self, _: &ProviderAccount) -> bool {
+        self.peer_discovered.load(Ordering::SeqCst)
+    }
+
+    fn signal(
+        &self,
+        _: &ProviderAccount,
+        _: Option<&str>,
+        _: SystemTime,
+    ) -> Option<gateway_core::account::UpstreamSchedulingSignal> {
+        None
+    }
 }
 
 impl MemoryAccountStore {
@@ -104,12 +132,29 @@ impl MemoryAccountStore {
         base_url: String,
         transport: provider_openai::credential::ResponsesTransport,
     ) {
+        self.seed_api_key_for_protocol(
+            id,
+            base_url,
+            transport,
+            provider_openai::credential::ApiKeyProtocol::Responses,
+        )
+        .await;
+    }
+
+    pub(crate) async fn seed_api_key_for_protocol(
+        &self,
+        id: &str,
+        base_url: String,
+        transport: provider_openai::credential::ResponsesTransport,
+        protocol: provider_openai::credential::ApiKeyProtocol,
+    ) {
         let credential = provider_openai::credential::CodexCredentialCodec::encode_complete(
             provider_openai::credential::CodexCredentialData::ApiKey(
                 provider_openai::credential::ApiKeyCredentialData {
                     schema_version: 1,
                     installation_id: uuid::Uuid::new_v4().to_string(),
                     base_url,
+                    protocol,
                     api_key: "sk-api-test-only".to_owned(),
                     transport,
                 },
@@ -148,6 +193,18 @@ impl MemoryAccountStore {
             .expect("account store lock")
             .get(&id)
             .map(|stored| stored.account.clone())
+    }
+
+    pub(crate) fn set_quota_settings(
+        &self,
+        id: &str,
+        limits: gateway_core::account::AccountQuotaSettings,
+    ) {
+        let mut accounts = self.accounts.lock().unwrap();
+        let stored = accounts
+            .get_mut(&ProviderAccountId::new(id).unwrap())
+            .unwrap();
+        stored.account = stored.account.clone().with_quota_settings(limits, false);
     }
 
     pub(crate) fn enable_quota_credits(&self, id: &str) {
@@ -205,6 +262,13 @@ impl MemoryAccountStore {
         self.largest_quota_read.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn hold_next_quota_read(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (read, ready) = oneshot::channel();
+        let (release, held) = oneshot::channel();
+        *self.next_quota_read.lock().unwrap() = Some((read, held));
+        (ready, release)
+    }
+
     pub(crate) fn quota_reads(&self) -> usize {
         self.quota_reads.load(Ordering::SeqCst)
     }
@@ -258,6 +322,112 @@ impl MemoryAccountStore {
 
 #[async_trait]
 impl ProviderAccountStore for MemoryAccountStore {
+    async fn load_quota_warmup_state(
+        &self,
+        account: &ProviderAccount,
+    ) -> Result<Option<gateway_core::account::QuotaWarmupState>, StoreError> {
+        let accounts = self.accounts.lock().unwrap();
+        if accounts
+            .get(account.id())
+            .is_none_or(|stored| stored.account.revision() != account.revision())
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.warmup_states
+                .lock()
+                .unwrap()
+                .get(account.id())
+                .cloned()
+                .unwrap_or_default(),
+        ))
+    }
+
+    async fn compare_and_swap_quota_warmup_state(
+        &self,
+        update: gateway_core::account::QuotaWarmupStateUpdate<'_>,
+    ) -> Result<bool, StoreError> {
+        let accounts = self.accounts.lock().unwrap();
+        let Some(stored) = accounts.get(update.account.id()) else {
+            return Ok(false);
+        };
+        if stored.account.revision() != update.account.revision()
+            || !stored.account.enabled()
+            || stored.account.quota_settings() != update.account.quota_settings()
+            || stored.account.credential_state() != update.account.credential_state()
+            || stored.account.quota().access() != update.account.quota().access()
+            || stored.account.quota_paused() != update.account.quota_paused()
+            || stored.quota.as_ref().map(|quota| quota.observed_at)
+                != update.expected_quota_observed_at
+        {
+            return Ok(false);
+        }
+        let mut states = self.warmup_states.lock().unwrap();
+        let state = states.entry(update.account.id().clone()).or_default();
+        if state.version != update.expected_version {
+            return Ok(false);
+        }
+        state.version += 1;
+        state.data = update.data;
+        Ok(true)
+    }
+
+    async fn load_account_catalogs(
+        &self,
+        provider: &ProviderKind,
+    ) -> Result<Vec<gateway_core::account::StoredAccountCatalog>, StoreError> {
+        let accounts = self.accounts.lock().unwrap();
+        let mut groups = BTreeMap::<bytes::Bytes, Vec<_>>::new();
+        for (id, (observation, document)) in self.catalogs.lock().unwrap().iter() {
+            if accounts.get(id).is_some_and(|row| {
+                row.account.provider() == provider
+                    && row.account.enabled()
+                    && matches!(
+                        row.account.credential_state(),
+                        CredentialState::Ready | CredentialState::Unknown
+                    )
+                    && row
+                        .account
+                        .access_token_expires_at()
+                        .is_none_or(|ts| ts > SystemTime::now())
+                    && row.account.revision() == observation.revision
+                    && row.account.plan_type() == observation.plan.as_deref()
+            }) {
+                groups
+                    .entry(document.clone())
+                    .or_default()
+                    .push(observation.clone());
+            }
+        }
+        Ok(groups
+            .into_iter()
+            .map(
+                |(document, accounts)| gateway_core::account::StoredAccountCatalog {
+                    accounts,
+                    document,
+                },
+            )
+            .collect())
+    }
+    async fn save_account_catalog(
+        &self,
+        observation: &gateway_core::account::AccountCatalogObservation,
+        document: &[u8],
+    ) -> Result<bool, StoreError> {
+        let rows = self.accounts.lock().unwrap();
+        if !rows.get(&observation.account_id).is_some_and(|a| {
+            a.account.revision() == observation.revision
+                && a.account.plan_type() == observation.plan.as_deref()
+        }) {
+            return Ok(false);
+        }
+        self.catalogs.lock().unwrap().insert(
+            observation.account_id.clone(),
+            (observation.clone(), bytes::Bytes::copy_from_slice(document)),
+        );
+        Ok(true)
+    }
+
     async fn create_account(&self, input: NewProviderAccount) -> Result<(), StoreError> {
         let mut accounts = self.accounts.lock().expect("account store lock");
         if accounts.contains_key(input.account.id()) {
@@ -345,13 +515,13 @@ impl ProviderAccountStore for MemoryAccountStore {
             ));
         }
         // 与 Postgres 实现的调度列表语义一致：停用账号不进入常规候选
-        Ok(self
-            .accounts
-            .lock()
-            .expect("account store lock")
-            .values()
+        let accounts = self.accounts.lock().unwrap();
+        Ok(account_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|id| accounts.get(id))
             .filter(|stored| stored.account.provider() == provider && stored.account.enabled())
-            .filter(|stored| account_ids.contains(stored.account.id()))
             .map(|stored| stored.account.clone())
             .collect())
     }
@@ -490,11 +660,19 @@ impl ProviderAccountStore for MemoryAccountStore {
         self.quota_reads.fetch_add(1, Ordering::SeqCst);
         self.largest_quota_read
             .fetch_max(accounts.len(), Ordering::SeqCst);
-        let stored = self.accounts.lock().expect("account store lock");
-        Ok(accounts
-            .iter()
-            .filter_map(|account| stored.get(account)?.quota.clone())
-            .collect())
+        let result = {
+            let stored = self.accounts.lock().expect("account store lock");
+            accounts
+                .iter()
+                .filter_map(|account| stored.get(account)?.quota.clone())
+                .collect()
+        };
+        let held = self.next_quota_read.lock().unwrap().take();
+        if let Some((read, held)) = held {
+            read.send(()).unwrap();
+            held.await.expect("release quota read");
+        }
+        Ok(result)
     }
 
     async fn get_quota_versions(
@@ -536,6 +714,16 @@ impl ProviderAccountStore for MemoryAccountStore {
         {
             return Ok(QuotaWriteOutcome::Conflict);
         }
+        let current_version = stored.quota.as_ref().map(|quota| quota.observed_at);
+        if observation.quota_pause.as_ref().is_some_and(|decision| {
+            &decision.limits != stored.account.quota_settings()
+                || current_version == Some(observation.observed_at)
+                || decision
+                    .merge_base
+                    .is_some_and(|base| base.observed_at != current_version)
+        }) {
+            return Ok(QuotaWriteOutcome::Conflict);
+        }
         if stored
             .quota
             .as_ref()
@@ -563,8 +751,10 @@ impl ProviderAccountStore for MemoryAccountStore {
                 Some(plan_type.clone()),
             ));
         }
+        let paused = observation.quota_pause.as_ref().is_some_and(|v| v.paused);
         stored.quota = Some(observation);
-        stored.account = rebuild_account(&stored.account, replacement);
+        stored.account = rebuild_account(&stored.account, replacement)
+            .with_quota_settings(stored.account.quota_settings().clone(), paused);
         Ok(QuotaWriteOutcome::Updated)
     }
 
@@ -772,6 +962,7 @@ fn rebuild_account(current: &ProviderAccount, rebuild: AccountRebuild) -> Provid
         rebuild.last_error_message,
     )
     .with_scheduling(current.concurrency_limit(), current.weight())
+    .with_quota_settings(current.quota_settings().clone(), current.quota_paused())
     .with_auto_use_quota_credits(current.auto_use_quota_credits())
     .with_refresh_schedule(rebuild.has_refresh_token, rebuild.next_refresh_at)
     .with_outbound_proxy(current.outbound_proxy().cloned())
@@ -817,6 +1008,7 @@ impl ProviderLeasePort for TestLeaseCoordinator {
                                 in_flight: 0,
                                 last_started_at: None,
                                 quota_reset_at: None,
+                                quota_reset_windows: None,
                                 quota_remaining_rank: None,
                                 cooldown: None,
                                 failure_rate_basis_points: None,
@@ -865,6 +1057,7 @@ impl ProviderLeasePort for TestLeaseCoordinator {
 
 #[derive(Default)]
 pub(crate) struct MemorySessionAffinity {
+    cursors: Mutex<BTreeMap<(ClientApiKeyId, ProviderKind), u64>>,
     operation_delay: Duration,
     initial_claim_barrier: Option<Arc<tokio::sync::Barrier>>,
     aliases: Mutex<BTreeMap<(String, String), gateway_core::provider_ports::ProviderSessionAlias>>,
@@ -976,48 +1169,77 @@ impl ProviderSessionAffinityPort for MemorySessionAffinity {
         })
     }
 
-    fn compare_and_bind<'a>(
+    fn round_robin_cursor<'a>(
         &'a self,
         provider: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
-        expected: Option<&'a gateway_core::provider_ports::ProviderSessionBinding>,
-        account: &'a ProviderAccountId,
-        ttl: Duration,
-    ) -> BoxFuture<
-        'a,
-        Result<Option<gateway_core::provider_ports::ProviderSessionBinding>, ProviderStoreError>,
-    > {
+        client: &'a ClientApiKeyId,
+    ) -> BoxFuture<'a, Result<u64, ProviderStoreError>> {
+        Box::pin(async move {
+            Ok(self
+                .cursors
+                .lock()
+                .unwrap()
+                .get(&(client.clone(), provider.clone()))
+                .copied()
+                .unwrap_or_default())
+        })
+    }
+
+    fn admit_account<'a>(
+        &'a self,
+        provider: &'a ProviderKind,
+        admission: ProviderAccountAdmission<'a>,
+    ) -> BoxFuture<'a, Result<bool, ProviderStoreError>> {
         Box::pin(async move {
             self.delay_operation().await;
-            // 让并发首请求都读到空绑定，再验证发送前的原子认领冲突
-            if expected.is_none()
+            if admission
+                .session()
+                .is_some_and(|claim| claim.expected.is_none())
                 && let Some(barrier) = &self.initial_claim_barrier
             {
                 barrier.wait().await;
             }
-            let key = (
-                provider.as_str().to_owned(),
-                key.expose_to_store().to_owned(),
-            );
-            let mut bindings = self.bindings.lock().expect("bindings");
-            if bindings.get(&key) != expected {
-                return Ok(None);
-            }
-            let binding = expected
-                .filter(|binding| binding.account_id() == account)
-                .cloned()
-                .unwrap_or_else(|| {
-                    gateway_core::provider_ports::ProviderSessionBinding::new(
-                        account.clone(),
+            let mut cursors = self.cursors.lock().unwrap();
+            let step = if let ProviderAccountAdmission::RoundRobin {
+                client_key, cursor, ..
+            } = admission
+            {
+                let current = cursors
+                    .entry((client_key.clone(), provider.clone()))
+                    .or_default();
+                if *current != cursor {
+                    return Ok(false);
+                }
+                Some(current)
+            } else {
+                None
+            };
+            if let Some(claim) = admission.session() {
+                let key = (
+                    provider.as_str().to_owned(),
+                    claim.key.expose_to_store().to_owned(),
+                );
+                let mut bindings = self.bindings.lock().unwrap();
+                if bindings.get(&key) != claim.expected {
+                    return Ok(false);
+                }
+                let binding = match claim.expected.filter(|b| b.account_id() == claim.account) {
+                    Some(binding) => binding.clone(),
+                    None => ProviderSessionBinding::new(
+                        claim.account.clone(),
                         uuid::Uuid::new_v4().simple().to_string(),
-                    )
-                    .expect("binding")
-                });
-            bindings.insert(key, binding.clone());
-            self.renewal_ttls.lock().expect("TTLs").push(ttl);
-            Ok(Some(binding))
+                    )?,
+                };
+                bindings.insert(key, binding);
+                self.renewal_ttls.lock().unwrap().push(claim.ttl);
+            }
+            if let Some(cursor) = step {
+                *cursor = cursor.wrapping_add(1);
+            }
+            Ok(true)
         })
     }
+
     fn load_alias<'a>(
         &'a self,
         provider: &'a ProviderKind,
@@ -1191,6 +1413,39 @@ pub(crate) fn profile(account_id: &str) -> CodexAccountProfile {
         email: Some(format!("{account_id}@example.com")),
         plan_type: Some("pro".to_owned()),
         access_token_expires_at: Some(now + chrono::Duration::hours(1)),
+    }
+}
+
+pub(crate) struct RequestProfileRuntimePolicy(
+    pub(crate) std::sync::Mutex<gateway_core::account::OpaqueProviderData>,
+);
+
+impl gateway_core::provider_ports::ProviderRuntimePolicyPort for RequestProfileRuntimePolicy {
+    fn load_request_profile<'a>(
+        &'a self,
+        provider: &'a ProviderKind,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<
+            Option<gateway_core::account::OpaqueProviderData>,
+            gateway_core::provider_ports::ProviderStoreError,
+        >,
+    > {
+        assert_eq!(provider.as_str(), "openai");
+        let profile = self.0.lock().unwrap().clone();
+        Box::pin(async move { Ok(Some(profile)) })
+    }
+
+    fn load_refresh_policy(
+        &self,
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<
+            gateway_core::provider_ports::ProviderRefreshPolicy,
+            gateway_core::provider_ports::ProviderStoreError,
+        >,
+    > {
+        Box::pin(async { crate::support::runtime_policy().load_refresh_policy().await })
     }
 }
 

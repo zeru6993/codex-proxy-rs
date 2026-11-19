@@ -35,8 +35,16 @@ pub(super) async fn fixture() -> AdminTestFixture {
             },
             daily_used_usd: "0.640001".parse().unwrap(),
             weekly_used_usd: "2.35".parse().unwrap(),
-            daily_resets_at: Some((now + Duration::days(1)).into()),
-            weekly_resets_at: Some((now + Duration::days(7)).into()),
+            daily_window: Some(gateway_core::engine::budget::ClientBudgetWindow {
+                start: now.into(),
+                end: (now + Duration::days(1)).into(),
+                explicit: false,
+            }),
+            weekly_window: Some(gateway_core::engine::budget::ClientBudgetWindow {
+                start: now.into(),
+                end: (now + Duration::days(7)).into(),
+                explicit: false,
+            }),
         },
         last_used_at: Some(now),
         created_at: now,
@@ -93,6 +101,7 @@ pub(super) async fn fixture() -> AdminTestFixture {
 fn usage_record() -> UsageListRecord {
     UsageListRecord {
         provider_account_upstream_peer: None,
+        has_upstream_error: false,
         error_code: None,
         error_message: None,
         error_kind: None,
@@ -101,6 +110,7 @@ fn usage_record() -> UsageListRecord {
         upstream_connection_exit_reason: None,
         recovered: false,
         client_status_code: None,
+        upstream_status_code: None,
         outcome: gateway_admin::model::observability::RequestOutcome::Succeeded,
         client_api_key_name: Some("Production".to_owned()),
         id: "req-visible".to_owned(),

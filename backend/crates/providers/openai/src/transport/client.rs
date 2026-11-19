@@ -82,17 +82,11 @@ pub(super) fn build_account_http_client_with_timeout(
     }
 
     // 连接池与 TCP、HTTP/2 保活沿用官方 Core 的 reqwest 默认值
-    let mut builder = Client::builder()
-        .no_proxy()
+    let builder = gateway_egress::http_client(proxy)
+        .map_err(|_| CustomCaError::ProxyConfiguration)?
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(timeout)
         .connector_layer(super::connection::ConnectionLayer);
-    if let Some(proxy) = proxy {
-        builder = builder.proxy(
-            reqwest::Proxy::all(proxy.expose_url())
-                .map_err(|_| CustomCaError::ProxyConfiguration)?,
-        );
-    }
     let client = build_reqwest_client_with_custom_ca(builder)?;
     let mut clients = cache
         .lock()
@@ -110,7 +104,7 @@ fn egress_key(account_id: &str, proxy: Option<&gateway_core::account::OutboundPr
     hash.update([0]);
     hash.update(
         proxy
-            .map_or("direct", |proxy| proxy.expose_url())
+            .map_or("deployment", |proxy| proxy.expose_url())
             .as_bytes(),
     );
     hex::encode(hash.finalize())
@@ -478,10 +472,6 @@ pub struct CodexRequestContext<'a> {
     pub turn_state: Option<&'a str>,
     /// 客户端 turn metadata；其中 installation ID 已按当前账号处理
     pub turn_metadata: Option<&'a str>,
-    /// x-codex-beta-features 头值
-    pub beta_features: Option<&'a str>,
-    /// x-responsesapi-include-timing-metrics 头值
-    pub include_timing_metrics: Option<&'a str>,
     /// 下游 `version` 扩展头；存在时上游值由 Desktop 版本画像统一生成
     pub version: Option<&'a str>,
     /// 客户端 window ID
@@ -498,8 +488,6 @@ pub struct CodexRequestContext<'a> {
     pub thread_id: Option<&'a str>,
     /// 客户端逻辑 request ID；缺失时使用代理请求 ID
     pub client_request_id: Option<&'a str>,
-    /// 客户端 turn ID
-    pub turn_id: Option<&'a str>,
     /// 账号亲和选择结果；仅用于结构化遥测，不参与 transport 决策
     pub account_selection: CodexAccountSelectionTelemetry<'a>,
 }
@@ -520,8 +508,6 @@ impl<'a> CodexRequestContext<'a> {
             request_id,
             turn_state: None,
             turn_metadata: None,
-            beta_features: None,
-            include_timing_metrics: None,
             version: None,
             codex_window_id: None,
             parent_thread_id: None,
@@ -530,7 +516,6 @@ impl<'a> CodexRequestContext<'a> {
             session_id: None,
             thread_id: None,
             client_request_id: None,
-            turn_id: None,
             account_selection: CodexAccountSelectionTelemetry::NONE,
         }
     }
@@ -590,6 +575,7 @@ pub enum CodexTransportDecision {
     ExactWebSocket,
     RequiredWebSocket,
     Http2WebSocketBudgetExhausted,
+    Http2WebSocketMessageTooLarge,
     Http2LocalConnectionCapacity,
     Http2BreakerOpen,
     Http2PoolUnavailable,
@@ -604,6 +590,7 @@ impl CodexTransportDecision {
             Self::ExactWebSocket => "ws_exact_required",
             Self::RequiredWebSocket => "ws_required",
             Self::Http2WebSocketBudgetExhausted => "http2_ws_budget_exhausted",
+            Self::Http2WebSocketMessageTooLarge => "http2_ws_message_too_large",
             Self::Http2LocalConnectionCapacity => "http2_local_connection_capacity",
             Self::Http2BreakerOpen => "http2_breaker_open",
             Self::Http2PoolUnavailable => "http2_pool_unavailable",
@@ -683,6 +670,7 @@ pub struct CodexBackendJsonResponse {
 pub(super) enum OpenAiUpstreamProtocol {
     Codex,
     ResponsesApi,
+    MessagesApi,
 }
 
 impl OpenAiUpstreamProtocol {
@@ -690,6 +678,7 @@ impl OpenAiUpstreamProtocol {
         match self {
             Self::Codex => super::endpoints::CODEX_RESPONSES_PATH,
             Self::ResponsesApi => "/responses",
+            Self::MessagesApi => "/messages",
         }
     }
 }
@@ -697,6 +686,7 @@ impl OpenAiUpstreamProtocol {
 /// Codex HTTP/SSE 上游客户端
 #[derive(Clone)]
 pub struct CodexBackendClient {
+    pub(crate) peer_route: Option<reqwest::header::HeaderValue>,
     pub(super) routing_affinity: Option<super::routing_affinity::ChatGptRoutingAffinity>,
     pub(super) privacy: Option<(
         Arc<dyn gateway_core::settings::privacy::CompiledPrivacyPolicy>,
@@ -705,7 +695,7 @@ pub struct CodexBackendClient {
     pub(super) timezone: gateway_core::time::DeploymentTimeZone,
     pub(super) connection_budget: Option<gateway_core::engine::connection::ConnectionBudget>,
     pub(super) client: Client,
-    pub(super) direct_client: Client,
+    pub(super) default_client: Client,
     pub(super) base_url: String,
     pub(super) official_base_url: String,
     pub(super) protocol: OpenAiUpstreamProtocol,
@@ -738,11 +728,12 @@ impl CodexBackendClient {
     ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         Self {
+            peer_route: None,
             routing_affinity: None,
             privacy: None,
             timezone: Default::default(),
             connection_budget: None,
-            direct_client: client.clone(),
+            default_client: client.clone(),
             client,
             websocket_origin_key: websocket_origin_key(&base_url),
             outbound_proxy: None,
@@ -874,6 +865,12 @@ impl CodexBackendClient {
         self
     }
 
+    pub(crate) fn with_messages_api_base_url(self, base_url: &str) -> Self {
+        let mut client = self.with_responses_api_base_url(Some(base_url));
+        client.protocol = OpenAiUpstreamProtocol::MessagesApi;
+        client
+    }
+
     pub fn for_account(
         &self,
         account: &gateway_core::account::ProviderAccount,
@@ -898,7 +895,7 @@ impl CodexBackendClient {
         client.client = if account.outbound_proxy().is_some() {
             build_account_http_client(account.id().as_str(), account.outbound_proxy())?
         } else {
-            self.direct_client.clone()
+            self.default_client.clone()
         };
         Ok(client)
     }

@@ -14,6 +14,7 @@ use gateway_core::event::{
 };
 use gateway_core::metering::Usage;
 use gateway_core::upstream::UpstreamSendState;
+use gateway_protocol::openai::OPENAI_PROTOCOL;
 use gateway_protocol::openai::events::{TokenUsage, billable_usage_is_complete, extract_usage};
 use gateway_protocol::openai::sse::{SseEvent, SseEventDecoder, SseFrame, sse_frame_is_done};
 use serde_json::Value;
@@ -265,6 +266,11 @@ impl CodexCanonicalDecoder {
         std::mem::take(&mut self.timing_signals)
     }
 
+    /// 使用累计输出事实判断中途失败的请求，避免把前导事件当作额度使用
+    pub(crate) const fn semantic_output_seen(&self) -> bool {
+        self.semantic_output_seen
+    }
+
     /// 返回本 attempt 的上游响应回显档位，仅供诊断，不作为本地计费依据
     #[must_use]
     pub fn response_service_tier(&self) -> Option<&str> {
@@ -301,7 +307,7 @@ impl CodexCanonicalDecoder {
             }
             let raw = Bytes::from(raw);
             if events.is_empty() {
-                if let Ok(wire) = ProtocolWireEvent::raw_sse("openai", raw) {
+                if let Ok(wire) = ProtocolWireEvent::raw_sse(OPENAI_PROTOCOL, raw) {
                     output.push(ProviderEvent::wire(wire));
                 }
                 continue;
@@ -346,10 +352,10 @@ impl CodexCanonicalDecoder {
                 );
                 let wire = match raw_sse_frame {
                     Some(RawResponseFrame::Sse(raw)) => {
-                        ProtocolWireEvent::raw_sse("openai", raw).ok()
+                        ProtocolWireEvent::raw_sse(OPENAI_PROTOCOL, raw).ok()
                     }
                     Some(RawResponseFrame::WebSocket(raw)) => {
-                        ProtocolWireEvent::raw_websocket("openai", raw).ok()
+                        ProtocolWireEvent::raw_websocket(OPENAI_PROTOCOL, raw).ok()
                     }
                     None => None,
                 };
@@ -474,12 +480,12 @@ impl CodexCanonicalDecoder {
         let sse_id = event.id;
         match raw_sse_frame {
             Some(RawResponseFrame::WebSocket(raw)) => {
-                ProtocolWireEvent::json("openai", event_type, value)
+                ProtocolWireEvent::json(OPENAI_PROTOCOL, event_type, value)
                     .map(|wire| wire.with_raw_websocket_message(raw))
             }
             Some(RawResponseFrame::Sse(raw_sse_frame)) => {
                 ProtocolWireEvent::json_with_raw_sse_metadata(
-                    "openai",
+                    OPENAI_PROTOCOL,
                     event_type,
                     value,
                     raw_sse_frame,
@@ -488,7 +494,7 @@ impl CodexCanonicalDecoder {
                 )
             }
             None => ProtocolWireEvent::json_with_sse_metadata(
-                "openai",
+                OPENAI_PROTOCOL,
                 event_type,
                 value,
                 sse_id,

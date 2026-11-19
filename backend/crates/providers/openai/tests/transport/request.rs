@@ -542,8 +542,37 @@ fn encoder_should_extract_websocket_context_from_client_metadata() {
     );
     assert_eq!(encoded.client_thread_id.as_deref(), Some("metadata-thread"));
     assert_eq!(encoded.turn_state.as_deref(), Some("metadata-turn-state"));
-    assert_eq!(encoded.client_turn_id.as_deref(), Some("metadata-turn-id"));
     assert_eq!(encoded.body().get("client_metadata"), Some(&metadata));
+}
+
+#[test]
+fn websocket_frame_turn_state_overrides_the_opening_header() {
+    let payload = ProtocolPayload::json_object(
+        "openai",
+        Map::from_iter([
+            ("model".to_owned(), json!("client-model")),
+            ("input".to_owned(), json!("prompt")),
+            (
+                "client_metadata".to_owned(),
+                json!({"x-codex-turn-state": "frame"}),
+            ),
+        ]),
+    )
+    .unwrap()
+    .with_context(Map::from_iter([
+        (
+            "downstream_websocket_connection_id".to_owned(),
+            json!("ws_test"),
+        ),
+        ("turn_state".to_owned(), json!("opening")),
+    ]));
+    let encoded = encode_generate_request(
+        &GenerateRequest::from_protocol_payload(payload),
+        "gpt-test",
+        None,
+    )
+    .unwrap();
+    assert_eq!(encoded.turn_state.as_deref(), Some("frame"));
 }
 
 #[test]
@@ -574,10 +603,6 @@ fn header_context_should_win_over_body_topline_aliases() {
             "turn_metadata".to_owned(),
             Value::String("header-turn-metadata".to_owned()),
         ),
-        (
-            "turn_id".to_owned(),
-            Value::String("header-turn-id".to_owned()),
-        ),
     ]));
     let request = GenerateRequest::from_protocol_payload(payload);
 
@@ -588,7 +613,6 @@ fn header_context_should_win_over_body_topline_aliases() {
         encoded.turn_metadata.as_deref(),
         Some("header-turn-metadata")
     );
-    assert_eq!(encoded.client_turn_id.as_deref(), Some("header-turn-id"));
 }
 
 #[test]

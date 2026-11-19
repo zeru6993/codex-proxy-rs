@@ -1,4 +1,4 @@
-//! OpenAI 客户端协议的 Bearer API key 认证
+//! 数据面客户端 Bearer 与 x-api-key 认证
 
 use axum::{
     http::{HeaderMap, header::AUTHORIZATION},
@@ -87,8 +87,9 @@ impl ClientApiKeyAuthError {
 pub(crate) async fn authenticate_client(
     service: &OpenAiService,
     headers: &HeaderMap,
+    accepted: ClientKeyHeaders,
 ) -> Result<AuthenticatedClient, ClientAccessError> {
-    let request = client_authentication_request(headers)?;
+    let request = client_authentication_request(headers, accepted)?;
     let client = service.authenticate(request).await?;
     if let Some(identified) = identify_codex_client(headers) {
         client
@@ -104,19 +105,38 @@ pub(crate) async fn verify_client(
     service: &OpenAiService,
     headers: &HeaderMap,
 ) -> Result<AuthenticatedClient, ClientApiKeyAuthError> {
-    let request = client_authentication_request(headers)?;
+    let request = client_authentication_request(headers, ClientKeyHeaders::Bearer)?;
     service.verify(request).await
+}
+
+/// 入口声明其认证头合同，所有形式仍进入同一 Client Key 认证链路
+#[derive(Clone, Copy)]
+pub(crate) enum ClientKeyHeaders {
+    Bearer,
+    Anthropic,
 }
 
 fn client_authentication_request(
     headers: &HeaderMap,
+    accepted: ClientKeyHeaders,
 ) -> Result<ClientAuthenticationRequest, ClientApiKeyAuthError> {
-    let raw = headers
-        .get(AUTHORIZATION)
-        .ok_or(ClientApiKeyAuthError::MissingAuthorization)?
-        .to_str()
-        .map_err(|_| ClientApiKeyAuthError::MalformedAuthorization)?;
-    let request = ClientAuthenticationRequest::new(raw.to_owned())
+    let raw = if let Some(authorization) = headers.get(AUTHORIZATION) {
+        authorization
+            .to_str()
+            .map_err(|_| ClientApiKeyAuthError::MalformedAuthorization)?
+            .to_owned()
+    } else if matches!(accepted, ClientKeyHeaders::Anthropic)
+        && let Some(key) = headers.get("x-api-key")
+    {
+        format!(
+            "Bearer {}",
+            key.to_str()
+                .map_err(|_| ClientApiKeyAuthError::MalformedAuthorization)?
+        )
+    } else {
+        return Err(ClientApiKeyAuthError::MissingAuthorization);
+    };
+    let request = ClientAuthenticationRequest::new(raw)
         .map_err(|_| ClientApiKeyAuthError::MalformedAuthorization)?;
     let request = request.with_request_context(
         crate::middleware::current().and_then(|context| context.extensions.shared_request()),
@@ -158,7 +178,7 @@ pub(crate) fn client_access_error_response(error: ClientAccessError) -> Response
     response
 }
 
-/// Desktop 优先于内嵌 CLI/Core；未知客户端及未提供应用版本的手机远程客户端返回 `None`
+/// 识别 Desktop 应用或 CLI/Core；未知客户端及未提供应用版本的手机远程客户端返回 `None`
 #[must_use]
 pub fn identify_codex_client(headers: &HeaderMap) -> Option<IdentifiedCodexClient> {
     const MAXIMUM_HEADER_LENGTH: usize = 4096;
@@ -176,25 +196,35 @@ pub fn identify_codex_client(headers: &HeaderMap) -> Option<IdentifiedCodexClien
         "codex_mcp_server",
     ];
 
-    let originator = bounded_ascii_header(headers, "originator", MAXIMUM_HEADER_LENGTH);
-    let user_agent = bounded_ascii_header(headers, "user-agent", MAXIMUM_HEADER_LENGTH);
-    let is_desktop = originator.is_some_and(|value| value.eq_ignore_ascii_case("Codex Desktop"))
+    let ascii_header = |name: &'static str| headers.get(name).and_then(|value| value.to_str().ok());
+    let raw_user_agent = ascii_header("user-agent");
+    // HeaderValue::to_str 只接受 ASCII，可以按字节截取搜索范围
+    let user_agent = raw_user_agent.map(|ua| &ua[..ua.len().min(MAXIMUM_HEADER_LENGTH)]);
+    let is_desktop = ascii_header("originator")
+        .is_some_and(|value| value.eq_ignore_ascii_case("Codex Desktop"))
         || user_agent.is_some_and(|value| contains_ascii_case_insensitive(value, "Codex Desktop"));
     if is_desktop {
-        let explicit_version = bounded_ascii_header(headers, "version", MAXIMUM_HEADER_LENGTH);
+        let version_header = headers.get("version");
         let user_agent_version = user_agent.and_then(desktop_version_from_user_agent);
-        // 手机远程初始化会覆盖进程级 UA 后缀，保留的 Desktop/Core 前缀不代表应用版本
-        // 仅缺失版本信息时免于门禁；已提供的版本即使非法，也继续按 Desktop 校验
-        if !headers.contains_key("version")
-            && user_agent_version.is_none()
-            && headers
-                .get("user-agent")
-                .is_some_and(|value| value.as_bytes().len() <= MAXIMUM_HEADER_LENGTH)
-            && user_agent.is_some_and(has_chatgpt_remote_user_agent_suffix)
+        if user_agent_version.is_none()
+            && let Some(ua) = raw_user_agent.filter(|ua| ua.len() <= MAXIMUM_HEADER_LENGTH)
+            && let Some(client) = user_agent_client_name(ua)
         {
-            return None;
+            // 共享 App Server 可保留 Desktop 进程名，TUI 请求的 version 头也可能重复 Core 版本
+            if client.eq_ignore_ascii_case("codex-tui")
+                && let Some(core) = desktop_core_version(ua)
+                && version_header.is_none_or(|value| value.as_bytes() == core.as_bytes())
+            {
+                return Some(IdentifiedCodexClient {
+                    kind: CodexClientKind::Cli,
+                    version: CodexClientVersion::parse(core).ok(),
+                });
+            }
+            if version_header.is_none() && is_chatgpt_remote_client(client) {
+                return None;
+            }
         }
-        let version = match explicit_version {
+        let version = match version_header.and_then(|value| value.to_str().ok()) {
             Some(value) => CodexClientVersion::parse(value).ok(),
             None => user_agent_version.and_then(|value| CodexClientVersion::parse(value).ok()),
         };
@@ -224,18 +254,6 @@ pub fn identify_codex_client(headers: &HeaderMap) -> Option<IdentifiedCodexClien
     None
 }
 
-fn bounded_ascii_header<'a>(
-    headers: &'a HeaderMap,
-    name: &'static str,
-    maximum_length: usize,
-) -> Option<&'a str> {
-    let value = headers.get(name)?.to_str().ok()?;
-    if !value.is_ascii() {
-        return None;
-    }
-    Some(&value[..value.len().min(maximum_length)])
-}
-
 fn desktop_version_from_user_agent(user_agent: &str) -> Option<&str> {
     let marker = "Codex Desktop;";
     let start = find_ascii_case_insensitive(user_agent, marker)? + marker.len();
@@ -246,27 +264,29 @@ fn desktop_version_from_user_agent(user_agent: &str) -> Option<&str> {
         .next()
 }
 
-fn has_chatgpt_remote_user_agent_suffix(user_agent: &str) -> bool {
-    let Some((_, suffix)) = user_agent
-        .strip_suffix(')')
-        .and_then(|value| value.rsplit_once(" ("))
-    else {
-        return false;
-    };
-    let Some((name, version)) = suffix.split_once("; ") else {
-        return false;
-    };
-    let Some(platform) = name
-        .strip_prefix("codex_chatgpt_")
-        .and_then(|value| value.strip_suffix("_remote"))
-    else {
-        return false;
-    };
-    [platform, version].into_iter().all(|value| {
+fn desktop_core_version(user_agent: &str) -> Option<&str> {
+    let (product, rest) = user_agent.split_once('/')?;
+    let (version, _) = rest.split_once(' ')?;
+    product
+        .eq_ignore_ascii_case("Codex Desktop")
+        .then_some(version)
+}
+
+fn user_agent_client_name(user_agent: &str) -> Option<&str> {
+    let (_, suffix) = user_agent.strip_suffix(')')?.rsplit_once(" (")?;
+    let (name, version) = suffix.split_once("; ")?;
+    let valid_token = |value: &str| {
         !value.is_empty()
             && !value.contains(['(', ')', ';'])
             && !value.bytes().any(|byte| byte.is_ascii_whitespace())
-    })
+    };
+    (valid_token(name) && valid_token(version)).then_some(name)
+}
+
+fn is_chatgpt_remote_client(name: &str) -> bool {
+    name.strip_prefix("codex_chatgpt_")
+        .and_then(|value| value.strip_suffix("_remote"))
+        .is_some_and(|platform| !platform.is_empty())
 }
 
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {

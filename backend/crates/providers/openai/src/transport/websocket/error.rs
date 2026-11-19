@@ -2,6 +2,7 @@
 
 use std::{fmt, time::Duration};
 
+use gateway_core::error::ProxyConnectionHint;
 use gateway_protocol::openai::sse::SseError;
 use thiserror::Error;
 use uuid::Uuid;
@@ -27,11 +28,16 @@ pub enum CodexWebSocketExchangeError {
     #[error("websocket transport error: {0}")]
     Transport(#[from] tungstenite::Error),
     /// DNS、TCP、TLS 或 opening handshake 在发送 payload 前失败
-    #[error("websocket connect failed before payload send: {0}")]
-    Connect(#[source] tungstenite::Error),
+    #[error("websocket connect failed before payload send: {source}")]
+    Connect {
+        #[source]
+        source: tungstenite::Error,
+        proxy_hint: Option<ProxyConnectionHint>,
+    },
     /// DNS、TCP、TLS 或 WebSocket upgrade 未在限定时间内完成
     #[error("websocket connect timed out after {timeout:?}")]
     ConnectTimeout {
+        proxy_hint: Option<ProxyConnectionHint>,
         /// 建连超时时长
         timeout: Duration,
     },
@@ -47,6 +53,9 @@ pub enum CodexWebSocketExchangeError {
     /// 连接已关闭或 pump 已退出，业务帧尚未交给底层发送
     #[error("websocket connection closed before payload send started")]
     SendNotStarted,
+    /// 最终请求帧超过当前握手声明的上限，尚未交给底层发送
+    #[error("websocket request exceeds the advertised message size limit")]
+    MessageTooLarge,
     /// payload 已可能送达上游，禁止自动重放到其他 transport 或账号
     #[error("websocket failed after payload send; replay outcome is ambiguous: {message}")]
     PostSendAmbiguous {
@@ -257,7 +266,7 @@ impl CodexWebSocketExchangeError {
     /// 与已有指标粗分类分开：缺少关闭握手本身不能证明收到 TCP RST
     pub(crate) fn transport_failure_reason(&self) -> Option<&'static str> {
         match self.diagnostic_cause() {
-            Self::Transport(error) | Self::Connect(error) => Some(match error {
+            Self::Transport(error) | Self::Connect { source: error, .. } => Some(match error {
                 tungstenite::Error::Protocol(
                     tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
                 ) => "reset_without_closing_handshake",

@@ -3,12 +3,13 @@
 //! Provider raw quota JSON 的唯一解析者：产出 [`CodexAccountQuotaSnapshot`]
 //! 供服务编排层消费；`limit_reached` 是快照级事实，不能只从子窗口反推
 
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use gateway_core::account::{
-    AccountQuotaSignals, CredentialRevision, ProviderAccountId, QuotaEvidence, QuotaObservation,
-    QuotaState,
+    AccountQuotaResetWindow, AccountQuotaSignals, CredentialRevision, ProviderAccountId,
+    QuotaEvidence, QuotaObservation, QuotaResetPeriod, QuotaState,
 };
 use gateway_protocol::openai::events::{CreditsSnapshot, parse_credits_from_object};
 use serde_json::{Map, Value};
@@ -120,10 +121,66 @@ pub struct CodexAccountQuotaSnapshot {
     fact: CodexQuotaFact,
     quota: QuotaState,
     windows: Vec<CodexQuotaWindow>,
+    unconfirmed_limits: BTreeMap<String, f64>,
+    pub(super) last_used_at: BTreeMap<String, i64>,
     pub(super) recovery: Option<QuotaRecovery>,
 }
 
 impl CodexAccountQuotaSnapshot {
+    pub(super) fn pause_decision(
+        &self,
+        limits: &gateway_core::account::AccountQuotaSettings,
+        merge_base: Option<super::QuotaMergeBase>,
+    ) -> gateway_core::account::QuotaPauseDecision {
+        gateway_core::account::QuotaPauseDecision {
+            merge_base,
+            limits: limits.clone(),
+            paused: self
+                .limit_usage()
+                .any(|(key, used)| limits.reached(key, Some(used))),
+        }
+    }
+
+    pub(crate) fn limit_usage(&self) -> impl Iterator<Item = (&str, f64)> {
+        self.windows
+            .iter()
+            .filter(|w| w.is_account_wide())
+            .filter_map(|w| Some((w.key(), w.used_percent()?)))
+            .chain(
+                self.unconfirmed_limits
+                    .iter()
+                    .map(|(key, &used)| (key.as_str(), used)),
+            )
+    }
+
+    /// 迟到的在途响应或不完整的刷新不能清除已确认的上限，只有对应窗口的新比例才能覆盖它
+    pub(super) fn retain_limit_evidence(
+        &mut self,
+        limits: &gateway_core::account::AccountQuotaSettings,
+        previous: Option<&Self>,
+        document: &mut Map<String, Value>,
+    ) {
+        self.unconfirmed_limits = previous
+            .into_iter()
+            .flat_map(Self::limit_usage)
+            .filter(|(key, used)| {
+                limits.reached(key, Some(*used))
+                    && !self.windows.iter().any(|w| {
+                        w.is_account_wide() && w.key() == *key && w.used_percent().is_some()
+                    })
+            })
+            .map(|(key, used)| (key.to_owned(), used))
+            .collect();
+        if self.unconfirmed_limits.is_empty() {
+            document.remove(super::LIMIT_EVIDENCE_FIELD);
+        } else {
+            document.insert(
+                super::LIMIT_EVIDENCE_FIELD.into(),
+                serde_json::json!(self.unconfirmed_limits),
+            );
+        }
+    }
+
     #[must_use]
     pub const fn account_id(&self) -> &ProviderAccountId {
         &self.account_id
@@ -315,6 +372,7 @@ pub(crate) fn quota_scheduling_signals(
     let now = SystemTime::now();
     let mut remaining_rank: Option<u64> = None;
     let mut reset_at: Option<SystemTime> = None;
+    let mut reset_windows = Vec::new();
     for window in &snapshot.windows {
         if quota_window_ttl(window, snapshot.observed_at(), now).is_none() {
             continue;
@@ -329,10 +387,22 @@ pub(crate) fn quota_scheduling_signals(
         }
         if let Some(reset) = window_reset_at.filter(|reset| *reset > now) {
             reset_at = Some(reset_at.map_or(reset, |current| current.min(reset)));
+            if window.is_account_wide() {
+                let period = match window.kind() {
+                    CodexQuotaWindowKind::ShortTerm => QuotaResetPeriod::FiveHour,
+                    CodexQuotaWindowKind::Weekly => QuotaResetPeriod::Weekly,
+                    CodexQuotaWindowKind::Monthly => QuotaResetPeriod::Monthly,
+                    CodexQuotaWindowKind::Other => continue,
+                };
+                reset_windows.push(AccountQuotaResetWindow {
+                    period,
+                    reset_at: reset,
+                });
+            }
         }
     }
     if remaining_rank.is_some() || reset_at.is_some() {
-        Some(AccountQuotaSignals::new(reset_at, remaining_rank))
+        Some(AccountQuotaSignals::new(reset_at, remaining_rank).with_reset_windows(reset_windows))
     } else {
         None
     }
@@ -346,16 +416,7 @@ pub(crate) fn parse_account_quota_snapshot(
 ) -> Result<CodexAccountQuotaSnapshot, CodexCredentialQuotaError> {
     let object = canonical_quota_object(usage)?;
     let fact = parse_codex_quota_object(&object)?;
-    let mut windows = Vec::new();
-    for limit in canonical_rate_limits(&object)? {
-        parse_rate_limit_windows(
-            &limit.source,
-            limit.account_wide,
-            limit.limit_name.as_deref(),
-            limit.rate_limit,
-            &mut windows,
-        )?;
-    }
+    let mut windows = quota_windows(&object)?;
     windows.sort_by(|left, right| {
         quota_source_order(left.source())
             .cmp(&quota_source_order(right.source()))
@@ -372,6 +433,16 @@ pub(crate) fn parse_account_quota_snapshot(
         account_id,
         credential_revision,
         observed_at,
+        last_used_at: object
+            .get(super::BUCKET_USAGE_FIELD)
+            .and_then(Value::as_object)
+            .map(|usage| {
+                usage
+                    .iter()
+                    .filter_map(|(source, at)| Some((source.clone(), at.as_i64()?)))
+                    .collect()
+            })
+            .unwrap_or_default(),
         plan_type: object
             .get("plan_type")
             .and_then(Value::as_str)
@@ -381,6 +452,12 @@ pub(crate) fn parse_account_quota_snapshot(
         fact,
         quota,
         windows,
+        unconfirmed_limits: object
+            .get(super::LIMIT_EVIDENCE_FIELD)
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .map_err(|_| CodexCredentialQuotaError::InvalidCredentialData)?
+            .unwrap_or_default(),
         recovery,
     })
 }
@@ -524,6 +601,22 @@ fn is_codex_limit_id(value: &str) -> bool {
     value.trim().eq_ignore_ascii_case("codex")
 }
 
+pub(super) fn quota_windows(
+    object: &Map<String, Value>,
+) -> Result<Vec<CodexQuotaWindow>, CodexCredentialQuotaError> {
+    let mut windows = Vec::new();
+    for limit in canonical_rate_limits(object)? {
+        parse_rate_limit_windows(
+            &limit.source,
+            limit.account_wide,
+            limit.limit_name.as_deref(),
+            limit.rate_limit,
+            &mut windows,
+        )?;
+    }
+    Ok(windows)
+}
+
 fn parse_rate_limit_windows(
     source: &str,
     account_wide: bool,
@@ -574,9 +667,7 @@ fn parse_rate_limit_windows(
             .transpose()?;
         let limit_reached = optional_bool(window, "limit_reached")?.unwrap_or(false);
         let kind = quota_window_kind(window_seconds);
-        // primary/secondary 是协议槽位，不代表固定周期
-        // 窗口身份使用上游
-        // limit_id 和实际时长，5h/周/月分类只参与展示
+        // 槽位不代表周期，窗口键保留上游额度桶和实际时长；周期分类供展示及智能调度使用
         let key = match window_seconds {
             Some(seconds) => format!("{source}:{seconds}s"),
             None => format!("{source}:{name}"),

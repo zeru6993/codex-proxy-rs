@@ -26,7 +26,32 @@ impl CodexBackendClient {
         self
     }
 
+    // 已识别的互联账号才携带路径，官方端点不参与节点转发
+    pub(super) fn route_to(&self, target: &Url) -> Option<&http::HeaderValue> {
+        self.peer_route.as_ref().filter(|_| {
+            self.protocol != super::client::OpenAiUpstreamProtocol::Codex
+                && !matches!(
+                    target.host_str(),
+                    Some("api.openai.com" | "api.anthropic.com")
+                )
+        })
+    }
+
     pub(super) async fn prepare_http_request(
+        &self,
+        endpoint: String,
+        mut headers: HeaderMap,
+        body: Bytes,
+    ) -> CodexClientResult<reqwest::Request> {
+        let target = Url::parse(&endpoint).map_err(|_| invalid_request())?;
+        headers.remove(gateway_protocol::peer::ROUTE_HEADER);
+        if let Some(path) = self.route_to(&target) {
+            headers.insert(gateway_protocol::peer::ROUTE_HEADER, path.clone());
+        }
+        self.prepare_http_outbound(endpoint, headers, body).await
+    }
+
+    async fn prepare_http_outbound(
         &self,
         endpoint: String,
         headers: HeaderMap,
@@ -78,6 +103,26 @@ impl CodexBackendClient {
     }
 
     pub(super) async fn prepare_websocket_request(
+        &self,
+        mut request: CodexWebSocketRequest,
+    ) -> CodexClientResult<(CodexWebSocketRequest, Option<String>)> {
+        let path = if self.peer_route.is_some()
+            && self.protocol != super::client::OpenAiUpstreamProtocol::Codex
+        {
+            let target =
+                Url::parse(request.connection().endpoint()).map_err(|_| invalid_request())?;
+            self.route_to(&target)
+                .map(http::HeaderValue::to_str)
+                .transpose()
+                .map_err(|_| invalid_request())?
+        } else {
+            None
+        };
+        request.connection.set_peer_route(path);
+        self.prepare_websocket_outbound(request).await
+    }
+
+    async fn prepare_websocket_outbound(
         &self,
         mut request: CodexWebSocketRequest,
     ) -> CodexClientResult<(CodexWebSocketRequest, Option<String>)> {

@@ -630,6 +630,7 @@ fn candidate(id: &str, weight: u16) -> AccountCandidate {
             in_flight: 0,
             last_started_at: None,
             quota_reset_at: None,
+            quota_reset_windows: None,
             quota_remaining_rank: None,
             cooldown: None,
             failure_rate_basis_points: None,
@@ -681,6 +682,7 @@ async fn scheduler_cannot_pick_outside_the_host_projected_priority_tier() {
             Some("upstream-a"),
             &candidates,
             &mut selection,
+            Default::default(),
         )
         .await
         .unwrap()

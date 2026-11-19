@@ -92,6 +92,18 @@ impl PoolBinding {
 }
 
 impl PreparedWebSocket {
+    pub(crate) fn max_message_bytes(&self) -> Option<usize> {
+        self.connection.metadata.max_message_bytes
+    }
+
+    /// 本地预检拒绝后先释放连接和池租约，再开始其他传输
+    pub(crate) async fn discard(self) {
+        let (lease, _, _) = self.binding.into_parts();
+        let websocket = self.connection.websocket;
+        let observation = websocket.observation().with_exit_reason("request_not_sent");
+        discard_connection(websocket, lease, observation).await;
+    }
+
     pub(crate) fn pool_decision(&self) -> Option<WebSocketPoolDecision> {
         self.binding.decision()
     }
@@ -440,7 +452,7 @@ fn start_pooled_websocket_connect(
 fn opening_failure_reason(error: &CodexWebSocketExchangeError) -> &'static str {
     match error.classified() {
         CodexWebSocketExchangeError::InvalidRequest(_) => "request_build_failure",
-        CodexWebSocketExchangeError::Connect(error)
+        CodexWebSocketExchangeError::Connect { source: error, .. }
         | CodexWebSocketExchangeError::Transport(error) => transport_metric_reason(error),
         CodexWebSocketExchangeError::ConnectTimeout { .. } => "connect_timeout",
         CodexWebSocketExchangeError::Upstream(_) => "upgrade_rejected",
@@ -645,7 +657,7 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
                 "reused": reused,
             }),
         );
-        discard_after_send(websocket, lease, observation.clone()).await;
+        discard_connection(websocket, lease, observation.clone()).await;
         let error = if not_started {
             if request.continuation().permits_fresh_connection() {
                 error
@@ -680,7 +692,7 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
     Ok(exchange)
 }
 
-async fn discard_after_send(
+async fn discard_connection(
     websocket: PumpedWebSocket,
     lease: Option<WebSocketPoolLease>,
     observation: super::pump::WebSocketConnectionObservation,

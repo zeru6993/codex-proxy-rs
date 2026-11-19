@@ -5,6 +5,7 @@ members = [
     "crates/gateway-admin",
     "crates/gateway-api",
     "crates/gateway-core",
+    "crates/gateway-egress",
     "crates/gateway-host",
     "crates/gateway-plugin/runtime",
     "crates/gateway-plugin/sdk",
@@ -61,5 +62,5 @@ codegen-units = 1
 panic = "abort"
 
 [patch.crates-io]
-# 固定包含 BEGIN 取消回滚与 SQLite 依赖安全修复的上游提交；见 transact-rs/sqlx#4394、#4502
+# 固定包含 BEGIN 取消回滚及 SQLite 安全版本支持的上游提交；见 transact-rs/sqlx#4394、#4502
 sqlx = { git = "https://github.com/transact-rs/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }

@@ -6,6 +6,7 @@ use std::{
 };
 
 use gateway_core::event::{GatewayEvent, ProtocolWireEvent, ProviderEvent};
+use gateway_protocol::openai::OPENAI_PROTOCOL;
 use gateway_protocol::openai::sse::{parse_sse_events, sse_frame_is_done};
 use serde_json::{Map, Value};
 
@@ -14,7 +15,7 @@ const MAX_IDENTIFIER_BYTES: usize = 1_024;
 
 /// 插件输出不能安全投递为 OpenAI Responses 协议
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ResponseValidationError;
+pub(in crate::openai) struct ResponseValidationError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalKind {
@@ -33,10 +34,10 @@ struct ExpectedResponseFacts {
 
 /// 仅保存最终协议复核所需的响应 ID 与终态类别，不缓存流正文
 #[derive(Clone, Default)]
-pub(super) struct ResponseValidationFacts(Arc<Mutex<ExpectedResponseFacts>>);
+pub(in crate::openai) struct ResponseValidationFacts(Arc<Mutex<ExpectedResponseFacts>>);
 
 impl ResponseValidationFacts {
-    pub(super) fn observe_event(&self, event: &ProviderEvent) {
+    pub(in crate::openai) fn observe_event(&self, event: &ProviderEvent) {
         let mut facts = self
             .0
             .lock()
@@ -44,7 +45,7 @@ impl ResponseValidationFacts {
         if let Some(wire) = event
             .middleware_origin_wire()
             .or_else(|| event.wire_event())
-            .filter(|wire| wire.protocol() == "openai")
+            .filter(|wire| wire.protocol() == OPENAI_PROTOCOL)
         {
             facts.observe_wire(wire);
         }
@@ -55,7 +56,7 @@ impl ResponseValidationFacts {
         }
     }
 
-    pub(super) fn observe_buffered(&self, events: &[ProviderEvent], original: &[u8]) {
+    pub(in crate::openai) fn observe_buffered(&self, events: &[ProviderEvent], original: &[u8]) {
         for event in events {
             self.observe_event(event);
         }
@@ -81,7 +82,7 @@ impl ResponseValidationFacts {
             .clone()
     }
 
-    pub(super) fn response_id(&self) -> Option<String> {
+    pub(in crate::openai) fn response_id(&self) -> Option<String> {
         self.snapshot().response_id
     }
 }
@@ -146,7 +147,7 @@ impl ExpectedResponseFacts {
 }
 
 /// 只复核中间件确实改写过的完整 JSON；未经改写的原生快路保持原行为
-pub(super) fn validate_buffered_response(
+pub(in crate::openai) fn validate_buffered_response(
     facts: &ResponseValidationFacts,
     modified: &[u8],
 ) -> Result<(), ResponseValidationError> {
@@ -176,7 +177,7 @@ pub(super) fn validate_buffered_response(
 /// 原始前缀只旁路构建状态；直到插件首次改写或丢弃正文才启用严格拒绝，避免给
 /// 无策略原生热路增加新的兼容性条件
 #[derive(Debug, Default)]
-pub(super) struct ResponsesDeliveryValidator {
+pub(in crate::openai) struct ResponsesDeliveryValidator {
     active: bool,
     invalid_prefix: bool,
     state: DeliveryState,
@@ -184,7 +185,7 @@ pub(super) struct ResponsesDeliveryValidator {
 
 impl ResponsesDeliveryValidator {
     /// 复核实际交付帧；只有宿主标记为已改写时才激活严格模式
-    pub(super) fn validate_frame(
+    pub(in crate::openai) fn validate_frame(
         &mut self,
         delivered: &[u8],
         transformed: bool,
@@ -194,7 +195,7 @@ impl ResponsesDeliveryValidator {
     }
 
     /// WebSocket JSON message 与 SSE 共用同一响应顺序和关联校验
-    pub(super) fn validate_websocket_frame(
+    pub(in crate::openai) fn validate_websocket_frame(
         &mut self,
         delivered: &[u8],
         transformed: bool,
@@ -263,11 +264,11 @@ impl ResponsesDeliveryValidator {
         self.state.apply(parsed)
     }
 
-    pub(super) fn response_id(&self) -> Option<&str> {
+    pub(in crate::openai) fn response_id(&self) -> Option<&str> {
         self.state.response_id.as_deref()
     }
 
-    pub(super) fn finish_delivery(&self) -> Result<(), ResponseValidationError> {
+    pub(in crate::openai) fn finish_delivery(&self) -> Result<(), ResponseValidationError> {
         if !self.active || self.state.done {
             Ok(())
         } else {
@@ -275,12 +276,14 @@ impl ResponsesDeliveryValidator {
         }
     }
 
-    pub(super) fn completed_response_id(&self) -> Option<&str> {
+    pub(in crate::openai) fn completed_response_id(&self) -> Option<&str> {
         self.response_id()
             .filter(|_| self.state.terminal == Some(TerminalKind::Completed))
     }
 
-    pub(super) fn finish_websocket_delivery(&self) -> Result<(), ResponseValidationError> {
+    pub(in crate::openai) fn finish_websocket_delivery(
+        &self,
+    ) -> Result<(), ResponseValidationError> {
         if !self.active || self.state.terminal.is_some() {
             Ok(())
         } else {

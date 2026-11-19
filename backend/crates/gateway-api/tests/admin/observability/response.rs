@@ -142,6 +142,7 @@ async fn dashboard_summary_should_include_quota_exhaustion_in_unavailable_headli
         provider_accounts: AccountPoolMetrics {
             total: 1002,
             normal: 943,
+            quota_paused: 0,
             quota_exhausted: 52,
             rate_limited: 0,
             disabled: 3,
@@ -425,7 +426,7 @@ async fn usage_detail_should_keep_attempt_snapshot_contract() {
                 upstream_transport: Some("http_sse".to_owned()),
                 upstream_send_state: Some("sent".to_owned()),
                 outcome: gateway_admin::model::observability::RequestOutcome::Failed,
-                downstream_committed: false,
+                downstream_committed: None,
                 status_code: Some(429),
                 provider_error_code: Some("rate_limit".to_owned()),
                 failure_kind: Some("rate_limited".to_owned()),
@@ -462,6 +463,8 @@ async fn usage_detail_should_keep_attempt_snapshot_contract() {
         .await
         .expect("usage detail body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("usage detail JSON");
+    assert_eq!(value["data"]["errorOrigin"], "upstream");
+    assert!(value["data"]["attempts"][0]["downstreamCommitted"].is_null());
     assert_eq!(value["data"]["errorKind"], "continuation_recovery_required");
     assert_eq!(value["data"]["errorCode"], "previous_response_not_found");
     assert_eq!(
@@ -914,7 +917,7 @@ pub(super) fn usage_record_with_account(
 }
 
 #[tokio::test]
-async fn usage_route_should_forward_name_and_model_contains_filters() {
+async fn usage_route_should_forward_record_text_filters() {
     use axum::{
         body::Body,
         http::{Request, StatusCode, header},
@@ -930,7 +933,7 @@ async fn usage_route_should_forward_name_and_model_contains_filters() {
         .with_state(fixture.state())
         .oneshot(
             Request::builder()
-                .uri("/api/admin/usage/records?model=%20coding%20&clientApiKeyName=%20Key%20%25%20&accountName=%20Account%20Name%20")
+                .uri("/api/admin/usage/records?model=%20coding%20&clientApiKeyName=%20Key%20%25%20&accountSearch=%20alice%40%20")
                 .header(header::COOKIE, "cpr_session=valid-session")
                 .header("x-request-id", "req_usage_other_outcome")
                 .body(Body::empty())
@@ -944,10 +947,7 @@ async fn usage_route_should_forward_name_and_model_contains_filters() {
     let filter = &observations.records.last().expect("usage query").filter;
     assert_eq!(filter.client_api_key_name.as_deref(), Some("Key %"));
     assert_eq!(filter.model_contains.as_deref(), Some("coding"));
-    assert_eq!(
-        filter.provider_account_name.as_deref(),
-        Some("Account Name")
-    );
+    assert_eq!(filter.provider_account_search.as_deref(), Some("alice@"));
     assert!(filter.client_api_key_ref.is_none());
     assert!(filter.provider_account_ref.is_none());
 }
@@ -981,6 +981,7 @@ async fn usage_route_projects_request_facts_and_billing() {
         .expect("usage records")
         .push(UsageListRecord {
             provider_account_upstream_peer: None,
+            has_upstream_error: false,
             error_code: None,
             error_message: None,
             error_kind: None,
@@ -989,6 +990,7 @@ async fn usage_route_projects_request_facts_and_billing() {
             upstream_connection_exit_reason: None,
             recovered: false,
             client_status_code: None,
+            upstream_status_code: None,
             outcome: gateway_admin::model::observability::RequestOutcome::Succeeded,
             client_api_key_name: Some("Production".to_owned()),
             id: "request_endpoint".to_owned(),
@@ -1078,6 +1080,8 @@ async fn usage_route_projects_request_facts_and_billing() {
         let mut failed = records[0].clone();
         failed.id = "request_failed".to_owned();
         failed.outcome = gateway_admin::model::observability::RequestOutcome::Failed;
+        failed.client_status_code = Some(503);
+        failed.upstream_status_code = Some(429);
         failed.error_code = Some("server_error".to_owned());
         failed.error_message = Some("The upstream service is temporarily unavailable.".to_owned());
         records.push(failed);
@@ -1111,6 +1115,19 @@ async fn usage_route_projects_request_facts_and_billing() {
     assert!(value["data"]["items"][0]["errorCode"].is_null());
     assert!(value["data"]["items"][0]["errorMessage"].is_null());
     assert_eq!(value["data"]["items"][3]["errorCode"], "server_error");
+    assert_eq!(value["data"]["items"][3]["clientStatusCode"], 503);
+    assert_eq!(value["data"]["items"][3]["upstreamStatusCode"], 429);
+    assert_eq!(value["data"]["items"][3]["errorOrigin"], "upstream");
+    assert_eq!(value["data"]["items"][4]["errorOrigin"], "upstream");
+    assert_eq!(value["data"]["items"][0]["errorOrigin"], "unknown");
+    assert_eq!(
+        value["data"]["items"][4].get("upstreamStatusCode"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(
+        value["data"]["items"][4].get("clientStatusCode"),
+        Some(&serde_json::Value::Null)
+    );
     assert_eq!(value["data"]["items"][4]["logicalOutcome"], "incomplete");
     assert_eq!(
         value["data"]["items"][4]["errorKind"],
@@ -1709,6 +1726,8 @@ async fn observability_queries_reject_group_filters_and_analytics_search() {
             "routingGroupRefs=group-a",
         ),
         ("/api/admin/usage/records/summary", "search=request-prefix"),
+        ("/api/admin/usage/records/summary", "errorOrigin=proxy"),
+        ("/api/admin/usage/insights/overview", "errorOrigin=proxy"),
         (
             "/api/admin/usage/insights/overview",
             "search=request-prefix",
@@ -1803,27 +1822,50 @@ pub(super) fn ops_error_record() -> gateway_admin::model::observability::OpsErro
 }
 
 #[tokio::test]
-async fn usage_status_query_accepts_three_modes_and_rejects_unknown_values() {
+async fn usage_record_query_accepts_error_sources_only_for_error_status() {
     use crate::admin::{AdminTestFixture, AdminTestState};
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
+    use gateway_admin::model::observability::{UsageErrorOrigin, UsageRecordStatus};
     use gateway_api::admin::observability;
     use tower::ServiceExt as _;
     let fixture = AdminTestFixture::new().await;
     fixture.auth.insert_session("valid-session");
-    for (status, expected) in [
-        ("success", StatusCode::OK),
-        ("error", StatusCode::OK),
-        ("all", StatusCode::OK),
-        ("failed", StatusCode::BAD_REQUEST),
+    for (query, expected) in [
+        ("", Some(UsageRecordStatus::Success)),
+        ("status=success", Some(UsageRecordStatus::Success)),
+        ("status=error", Some(UsageRecordStatus::Error(None))),
+        ("status=all", Some(UsageRecordStatus::All)),
+        (
+            "status=error&errorOrigin=proxy",
+            Some(UsageRecordStatus::Error(Some(UsageErrorOrigin::Proxy))),
+        ),
+        (
+            "status=error&errorOrigin=upstream",
+            Some(UsageRecordStatus::Error(Some(UsageErrorOrigin::Upstream))),
+        ),
+        (
+            "status=error&errorOrigin=connection",
+            Some(UsageRecordStatus::Error(Some(UsageErrorOrigin::Connection))),
+        ),
+        (
+            "status=error&errorOrigin=unknown",
+            Some(UsageRecordStatus::Error(Some(UsageErrorOrigin::Unknown))),
+        ),
+        ("status=failed", None),
+        ("errorOrigin=proxy", None),
+        ("status=success&errorOrigin=proxy", None),
+        ("status=all&errorOrigin=unknown", None),
+        ("status=error&errorOrigin=other", None),
+        ("status=error&errorOrigin=", None),
     ] {
         let response = observability::router::<AdminTestState>()
             .with_state(fixture.state())
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/admin/usage/records?status={status}"))
+                    .uri(format!("/api/admin/usage/records?{query}"))
                     .header(header::COOKIE, "cpr_session=valid-session")
                     .header("x-request-id", "usage_status_fixture")
                     .body(Body::empty())
@@ -1835,17 +1877,15 @@ async fn usage_status_query_accepts_three_modes_and_rejects_unknown_values() {
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         assert_eq!(
             actual,
-            expected,
-            "{status}: {}",
+            if expected.is_some() {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            "{query}: {}",
             String::from_utf8_lossy(&body)
         );
-        if expected == StatusCode::OK {
-            use gateway_admin::model::observability::UsageRecordStatus;
-            let status_value = match status {
-                "success" => UsageRecordStatus::Success,
-                "error" => UsageRecordStatus::Error,
-                _ => UsageRecordStatus::All,
-            };
+        if let Some(status_value) = expected {
             assert_eq!(
                 fixture
                     .observations

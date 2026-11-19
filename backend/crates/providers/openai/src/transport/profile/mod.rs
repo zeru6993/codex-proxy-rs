@@ -20,6 +20,7 @@ use url::Url;
 
 use self::desktop_artifact::{CodexDesktopArtifactError, fetch_codex_core_version};
 
+mod baseline;
 pub mod cli_release;
 mod context;
 pub mod desktop_artifact;
@@ -33,11 +34,12 @@ use selection::{ClientKind, ClientPlatform, ClientRelease};
 pub const CODEX_DESKTOP_APPCAST_URL: &str =
     "https://persistent.oaistatic.com/codex-app-prod/appcast.xml";
 /// 官方发布元数据检查周期
-pub const APPCAST_POLL_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const APPCAST_POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 const APPCAST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_APPCAST_BYTES: usize = 1024 * 1024;
 const ARTIFACT_PROFILE_CACHE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const ARTIFACT_PROFILE_CACHE_RENEW_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const ARTIFACT_PROFILE_SCHEMA_VERSION: u64 = 1;
 
 /// 保留已有配置类型入口；位置规则由出口领域统一维护
@@ -82,22 +84,23 @@ pub struct CodexWireProfile {
 
 impl Default for CodexWireProfile {
     fn default() -> Self {
+        let release = baseline::MACOS_RELEASE;
+        let environment = baseline::MACOS_ENVIRONMENT;
         Self {
             client_kind: ClientKind::Desktop,
-            originator: "Codex Desktop".to_owned(),
-            codex_version: "0.153.4".to_owned(),
-            desktop_version: "26.901.51231".to_owned(),
-            desktop_build: "8109".to_owned(),
-            os_type: "Mac OS".to_owned(),
-            os_version: "15.7.1".to_owned(),
-            arch: "arm64".to_owned(),
-            terminal: "unknown".to_owned(),
+            originator: baseline::DESKTOP_ORIGINATOR.to_owned(),
+            codex_version: release.core.version.to_owned(),
+            desktop_version: release.version.to_owned(),
+            desktop_build: release.build.to_owned(),
+            os_type: environment.os_type.to_owned(),
+            os_version: environment.os_version.to_owned(),
+            arch: environment.arch.to_owned(),
+            terminal: baseline::TERMINAL.to_owned(),
             exact_user_agent: None,
             installation_seed: None,
             residency: None,
             account_routing_override: None,
-            // 制品核验于 2026-09-06T03:26:12.084Z；进程启动不构成重新核验
-            verified_at: DateTime::UNIX_EPOCH + chrono::Duration::milliseconds(1_788_665_172_084),
+            verified_at: release.core.verified_at(),
         }
     }
 }
@@ -555,13 +558,13 @@ pub struct OfficialCodexDesktopReleaseTransport {
 }
 
 impl OfficialCodexDesktopReleaseTransport {
-    /// 构造禁用环境代理和 redirect 的官方 HTTPS transport
+    /// 构造使用部署出口且禁用 redirect 的官方 HTTPS transport
     pub fn new() -> Result<Self, CodexDesktopReleaseError> {
         let endpoint = Url::parse(CODEX_DESKTOP_APPCAST_URL)
             .map_err(|_| CodexDesktopReleaseError::InvalidEndpoint)?;
-        let client = Client::builder()
+        let client = gateway_egress::http_client(None)
+            .map_err(|_| CodexDesktopReleaseError::ClientInitialization)?
             .https_only(true)
-            .no_proxy()
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(APPCAST_TIMEOUT)
@@ -632,6 +635,7 @@ pub struct CodexDesktopReleaseService {
     profile: CodexWireProfileState,
     cache: CodexArtifactProfileCache,
     verified: Arc<RwLock<Option<CodexBundledReleaseProfile>>>,
+    cache_written_at: Arc<RwLock<Option<tokio::time::Instant>>>,
 }
 
 impl CodexDesktopReleaseService {
@@ -666,6 +670,7 @@ impl CodexDesktopReleaseService {
             profile,
             cache,
             verified: Arc::new(RwLock::new(verified)),
+            cache_written_at: Arc::default(),
         }
     }
 
@@ -730,10 +735,24 @@ impl CodexDesktopReleaseService {
                 {
                     return Err(CodexDesktopReleaseError::InconsistentRelease);
                 }
-                if !self.cache.replace_if_newer(&verified).await? {
-                    return Err(CodexDesktopReleaseError::ReleaseRollback);
+                // 轻量检查只推进观察时间，缓存单独按天续期
+                let renewal_due = self
+                    .cache_written_at
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_none_or(|written| {
+                        written.elapsed() >= ARTIFACT_PROFILE_CACHE_RENEW_INTERVAL
+                    });
+                if renewal_due {
+                    if !self.cache.replace_if_newer(&verified).await? {
+                        return Err(CodexDesktopReleaseError::ReleaseRollback);
+                    }
+                    *self
+                        .cache_written_at
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(tokio::time::Instant::now());
                 }
-                self.profile.update_bundled_release(&verified);
                 return Ok(release);
             }
         }
@@ -764,6 +783,10 @@ impl CodexDesktopReleaseService {
             .verified
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(published);
+        *self
+            .cache_written_at
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tokio::time::Instant::now());
         Ok(release)
     }
 }

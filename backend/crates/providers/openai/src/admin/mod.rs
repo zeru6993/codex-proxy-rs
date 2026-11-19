@@ -48,6 +48,7 @@ use gateway_core::provider_ports::{
     ProviderStoreErrorKind,
 };
 use gateway_core::routing::{ProviderKind, UpstreamModelId};
+use gateway_protocol::openai::OPENAI_PROTOCOL;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::{Map, Number, Value};
@@ -205,6 +206,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
     ) -> gateway_admin::model::accounts::ProviderAccountCapabilities {
         let oauth = authentication_kind == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH;
         gateway_admin::model::accounts::ProviderAccountCapabilities {
+            quota_settings_supported: oauth,
             quota_credits: oauth,
             quota: oauth,
             quota_refresh: oauth,
@@ -263,8 +265,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
     }
 
     fn plan_type_display(&self, plan_type: &str) -> String {
-        // Pro 系列按套餐类型区分展示，其他套餐遵循官方 KnownPlan::display_name
-        // 只映射展示名称，原始套餐值与未知套餐保持不变
+        // Pro 三档沿用管理端短名，其余已知套餐使用 Codex /status 的名称
         match plan_type.to_ascii_lowercase().as_str() {
             "free" => "Free",
             "go" => "Go",
@@ -272,16 +273,17 @@ impl ProviderAdmin for OpenAiAdminProvider {
             "pro" => "Pro",
             "prolite" => "ProLite",
             "promax" => "ProMax",
-            "team" => "Team",
-            "self_serve_business_prolite" => "Self Serve Business ProLite",
-            "self_serve_business_usage_based" => "Self Serve Business Usage Based",
-            "business" => "Business",
-            "ent26" | "enterprise" | "hc" => "Enterprise",
+            "team" | "self_serve_business_usage_based" => "Business",
+            "self_serve_business_prolite" => "Business Premium",
+            "business" | "ent26" | "enterprise" | "hc" | "enterprise_cbp_usage_based" => {
+                "Enterprise"
+            }
             "enterprise_cbp_automation" => "Enterprise (Automation)",
-            "enterprise_cbp_usage_based" => "Enterprise CBP Usage Based",
             "edu" | "education" => "Edu",
             "edu_plus" => "Edu Plus",
             "edu_pro" => "Edu Pro",
+            "sci" => "Academic Researchers",
+            "sci_plus" => "Academic Researchers Plus",
             _ => plan_type,
         }
         .to_owned()
@@ -296,7 +298,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
             return;
         }
         self.quota.invalidate_scheduling(account_ids);
-        if let Err(error) = self.catalog.invalidate() {
+        if let Err(error) = self.catalog.invalidate_accounts(account_ids).await {
             tracing::warn!(
                 account_count = account_ids.len(),
                 error = %error,
@@ -738,7 +740,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
             if refresh {
                 return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
             }
-            return Ok(project_quota(None, false));
+            return Ok(empty_quota());
         }
         let snapshot = if refresh {
             let snapshot = Some(
@@ -755,7 +757,11 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 .await
                 .map_err(map_quota_error)?
         };
-        Ok(project_quota(snapshot, account.quota().is_exhausted()))
+        Ok(project_quota(
+            snapshot,
+            account.quota().is_exhausted(),
+            account.quota_settings(),
+        ))
     }
 
     async fn read_quotas(
@@ -791,35 +797,31 @@ impl ProviderAdmin for OpenAiAdminProvider {
         }
     }
 
+    fn quota_history_parser(
+        &self,
+    ) -> Option<gateway_admin::model::quota_history::QuotaHistoryParser> {
+        Some(quota::history_reading)
+    }
+
     fn quota_forecast_observation(
         &self,
         document: &ProviderDocument,
         window: &ProviderQuotaWindow,
     ) -> Option<QuotaForecastObservation> {
-        use gateway_protocol::openai::events::parse_rate_limit_headers;
-
         if window.local_usage_attribution != QuotaLocalUsageAttribution::AccountWide {
             return None;
         }
-        let value = document
-            .expose_to_provider()
-            .expose_to_provider()
-            .get("rateLimitHeaders")?;
-        let headers: Vec<(String, String)> = serde_json::from_value(value.clone()).ok()?;
-        let parsed = parse_rate_limit_headers(&headers)?;
-        let limit = parsed.limits.get(window.limit_id.as_deref()?)?;
-        let observed = match window.role? {
-            ProviderQuotaWindowRole::Primary => limit.primary?,
-            ProviderQuotaWindowRole::Secondary => limit.secondary?,
-            ProviderQuotaWindowRole::Monthly => return None,
-        };
-        if observed.window_minutes?.checked_mul(60)? != window.window_seconds? {
+        let (observed, plan_type) = quota::history_window(document, &window.key)?;
+        if Some(observed.source()) != window.limit_id.as_deref()
+            || Some(quota_role(observed.role())) != window.role
+            || observed.window_seconds()? != window.window_seconds?
+        {
             return None;
         }
         Some(QuotaForecastObservation {
-            used_percent: observed.used_percent,
-            reset_at: DateTime::<Utc>::from_timestamp(observed.reset_at?, 0)?,
-            plan_type: parsed.plan_type,
+            used_percent: observed.used_percent()?,
+            reset_at: observed.reset_at()?,
+            plan_type,
         })
     }
 
@@ -1223,6 +1225,7 @@ fn account_matches_record(account: &ProviderAccount, record: &AccountRecord) -> 
 
 fn empty_quota() -> ProviderQuota {
     ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         credits: None,
         plan_type: None,
@@ -1237,15 +1240,19 @@ fn empty_quota() -> ProviderQuota {
 fn project_quota(
     snapshot: Option<CodexAccountQuotaSnapshot>,
     limit_reached: bool,
+    limits: &gateway_core::account::AccountQuotaSettings,
 ) -> ProviderQuota {
     let mut quota = snapshot
-        .map(project_quota_snapshot)
+        .map(|s| project_quota_snapshot(s, limits))
         .unwrap_or_else(empty_quota);
     quota.limit_reached = limit_reached;
     quota
 }
 
-fn project_quota_snapshot(snapshot: CodexAccountQuotaSnapshot) -> ProviderQuota {
+fn project_quota_snapshot(
+    snapshot: CodexAccountQuotaSnapshot,
+    limits: &gateway_core::account::AccountQuotaSettings,
+) -> ProviderQuota {
     let mut provider_data = Map::new();
     provider_data.insert(
         "remaining_percent".to_owned(),
@@ -1287,6 +1294,11 @@ fn project_quota_snapshot(snapshot: CodexAccountQuotaSnapshot) -> ProviderQuota 
     // 在窗口全部过期后继续维持限流
     let limit_reached = quota_windows_limit_reached(&windows);
     ProviderQuota {
+        paused_windows: snapshot
+            .limit_usage()
+            .filter(|(key, used)| limits.reached(key, Some(*used)))
+            .map(|(key, _)| key.to_owned())
+            .collect(),
         upstream: None,
         plan_type: snapshot.plan_type().map(str::to_owned),
         observed_at: Some(DateTime::<Utc>::from(snapshot.observed_at())),
@@ -1713,7 +1725,7 @@ fn build_connection_test_operation(
     );
     body.insert("stream".to_owned(), Value::Bool(true));
     body.insert("store".to_owned(), Value::Bool(false));
-    let payload = ProtocolPayload::json_object("openai", body)
+    let payload = ProtocolPayload::json_object(OPENAI_PROTOCOL, body)
         .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
     Ok(Operation::Generate(GenerateRequest::from_protocol_payload(
         payload,
@@ -1941,6 +1953,11 @@ fn map_quota_error(error: CodexCredentialQuotaError) -> ProviderAdminError {
     use CodexCredentialQuotaError as Error;
     use ProviderAdminErrorKind as Kind;
     let (kind, public_message, upstream_message) = match error {
+        Error::Profile(source) => {
+            return provider_admin_error(Kind::Unavailable)
+                .with_public_message("OpenAI 账号预热客户端身份不可用")
+                .with_source(source);
+        }
         Error::InvalidCredentialData => (
             Kind::Invalid,
             "OpenAI 额度查询凭据无效，请检查账号授权",
@@ -2115,6 +2132,11 @@ fn map_catalog_error(error: CodexCredentialCatalogError) -> ProviderAdminError {
             "OpenAI 模型查询失败，请检查出站连接与上游服务",
         ),
         Error::Cache => (Kind::Unavailable, "OpenAI 模型目录缓存暂不可用"),
+        Error::Profile(source) => {
+            return provider_admin_error(Kind::Unavailable)
+                .with_public_message("OpenAI 模型目录客户端身份不可用")
+                .with_source(source);
+        }
     };
     provider_admin_error(kind).with_public_message(message)
 }

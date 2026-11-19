@@ -3,7 +3,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures::FutureExt;
@@ -12,7 +12,8 @@ use crate::concurrency::{CapacityWait, ConcurrencyQueuePolicy, QueueRejection};
 use crate::identity::ProviderKind;
 
 use super::{
-    AccountConcurrency, AccountStatus, ProviderAccount, ProviderAccountId, SmartSchedulingConfig,
+    AccountConcurrency, AccountStatus, ProviderAccount, ProviderAccountId, ResetWindowWeights,
+    SmartSchedulingConfig,
 };
 
 /// `runtime_settings.rotation_strategy` 的稳定值
@@ -90,6 +91,7 @@ impl AccountAffinity {
 pub struct AccountSelectionPolicy {
     strategy: RotationStrategy,
     smart_scheduling: SmartSchedulingConfig,
+    quota_reset_window_weights: ResetWindowWeights,
     max_concurrent_per_account: AccountConcurrency,
     queue_policy: ConcurrencyQueuePolicy,
     openai_guardian_reserved_concurrency: u32,
@@ -108,6 +110,7 @@ impl AccountSelectionPolicy {
         Self {
             strategy,
             smart_scheduling: SmartSchedulingConfig::default(),
+            quota_reset_window_weights: ResetWindowWeights::default(),
             max_concurrent_per_account: max_concurrent_per_account.into(),
             openai_guardian_reserved_concurrency: 0,
             openai_account_affinity: AccountAffinity::default(),
@@ -119,6 +122,17 @@ impl AccountSelectionPolicy {
                 timeout: Duration::ZERO,
             },
         }
+    }
+
+    #[must_use]
+    pub const fn with_quota_reset_window_weights(mut self, weights: ResetWindowWeights) -> Self {
+        self.quota_reset_window_weights = weights;
+        self
+    }
+
+    #[must_use]
+    pub const fn quota_reset_window_weights(self) -> ResetWindowWeights {
+        self.quota_reset_window_weights
     }
 
     #[must_use]
@@ -245,6 +259,7 @@ pub struct AccountRuntimeSignals {
     pub in_flight: u32,
     pub last_started_at: Option<SystemTime>,
     pub quota_reset_at: Option<SystemTime>,
+    pub quota_reset_windows: Option<Arc<[AccountQuotaResetWindow]>>,
     /// Provider 归一化的剩余额度基点：0 耗尽，10_000 全部可用
     pub quota_remaining_rank: Option<u64>,
     pub cooldown: Option<super::AccountCooldown>,
@@ -459,6 +474,7 @@ impl AccountRuntimeSignals {
     pub fn with_provider_quota(mut self, quota: Option<AccountQuotaSignals>) -> Self {
         if let Some(quota) = quota {
             self.quota_reset_at = quota.reset_at;
+            self.quota_reset_windows = quota.reset_windows;
             self.quota_remaining_rank = quota.remaining_rank;
         }
         self
@@ -482,9 +498,17 @@ impl AccountRuntimeSignals {
     }
 }
 
+/// Provider 确认为账号通用且属于受支持周期的重置观测
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountQuotaResetWindow {
+    pub period: super::QuotaResetPeriod,
+    pub reset_at: SystemTime,
+}
+
 /// Provider 从私有 quota JSON 投影出的中立调度事实
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountQuotaSignals {
+    reset_windows: Option<Arc<[AccountQuotaResetWindow]>>,
     reset_at: Option<SystemTime>,
     remaining_rank: Option<u64>,
 }
@@ -496,16 +520,23 @@ impl AccountQuotaSignals {
         Self {
             reset_at,
             remaining_rank,
+            reset_windows: None,
         }
     }
 
     #[must_use]
-    pub const fn reset_at(self) -> Option<SystemTime> {
+    pub fn with_reset_windows(mut self, windows: Vec<AccountQuotaResetWindow>) -> Self {
+        self.reset_windows = (!windows.is_empty()).then(|| windows.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn reset_at(&self) -> Option<SystemTime> {
         self.reset_at
     }
 
     #[must_use]
-    pub const fn remaining_rank(self) -> Option<u64> {
+    pub const fn remaining_rank(&self) -> Option<u64> {
         self.remaining_rank
     }
 }
@@ -782,24 +813,31 @@ impl AccountSelector {
         let candidate = match context.policy.strategy() {
             RotationStrategy::QuotaResetPriority => {
                 eligible.sort_by(|left, right| {
-                    (
-                        left.signals.quota_reset_at.is_none(),
-                        left.signals.quota_reset_at,
-                    )
-                        .cmp(&(
-                            right.signals.quota_reset_at.is_none(),
-                            right.signals.quota_reset_at,
-                        ))
-                        .then_with(|| {
-                            capacity_utilization(left, context)
-                                .total_cmp(&capacity_utilization(right, context))
-                        })
-                        .then_with(|| {
-                            left.signals
-                                .last_started_at
-                                .cmp(&right.signals.last_started_at)
-                        })
-                        .then_with(|| left.account.id().cmp(right.account.id()))
+                    let windows = context.policy.quota_reset_window_weights();
+                    if windows.enabled() {
+                        windows
+                            .score(&right.signals, context.now)
+                            .total_cmp(&windows.score(&left.signals, context.now))
+                    } else {
+                        (
+                            left.signals.quota_reset_at.is_none(),
+                            left.signals.quota_reset_at,
+                        )
+                            .cmp(&(
+                                right.signals.quota_reset_at.is_none(),
+                                right.signals.quota_reset_at,
+                            ))
+                    }
+                    .then_with(|| {
+                        capacity_utilization(left, context)
+                            .total_cmp(&capacity_utilization(right, context))
+                    })
+                    .then_with(|| {
+                        left.signals
+                            .last_started_at
+                            .cmp(&right.signals.last_started_at)
+                    })
+                    .then_with(|| left.account.id().cmp(right.account.id()))
                 });
                 eligible.first().copied()?
             }
@@ -908,7 +946,7 @@ impl AccountSelector {
         if context
             .account_scope
             .as_ref()
-            .is_some_and(|scope| !scope.allows_current_account(&candidate.account))
+            .is_some_and(|scope| !scope.allows(candidate.account.id()))
         {
             return Some(AccountSchedulingBlocker::OutsideClientScope);
         }
@@ -940,8 +978,6 @@ impl AccountSelector {
 
 // 首输出 10 秒时延迟得分减半；固定尺度不随其他候选账号变化
 const SMART_LATENCY_HALF_SCORE_MS: f64 = 10_000.0;
-// 距重置一小时时得分减半；未知和已过期时间不提供重置奖励
-const SMART_RESET_HALF_SCORE_SECONDS: f64 = 3_600.0;
 
 fn capacity_utilization(candidate: &AccountCandidate, context: &AccountSelectionContext) -> f64 {
     context
@@ -997,15 +1033,6 @@ pub(crate) fn smart_score(candidate: &AccountCandidate, context: &AccountSelecti
             SMART_LATENCY_HALF_SCORE_MS / (SMART_LATENCY_HALF_SCORE_MS + latency as f64)
         });
 
-    let reset = candidate
-        .signals
-        .quota_reset_at
-        .and_then(|reset| reset.duration_since(now).ok())
-        .filter(|remaining| !remaining.is_zero())
-        .map_or(0.0, |remaining| {
-            SMART_RESET_HALF_SCORE_SECONDS
-                / (SMART_RESET_HALF_SCORE_SECONDS + remaining.as_secs_f64())
-        });
     let [
         load_weight,
         quota_weight,
@@ -1018,5 +1045,5 @@ pub(crate) fn smart_score(candidate: &AccountCandidate, context: &AccountSelecti
         + quota_weight * quota
         + health_weight * failure
         + latency_weight * latency
-        + reset_weight * reset
+        + reset_weight * config.reset_score(&candidate.signals, now)
 }

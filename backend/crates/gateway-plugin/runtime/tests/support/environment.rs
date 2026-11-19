@@ -118,6 +118,21 @@ impl Environment {
         .execute(&self.admin).await.unwrap();
     }
 
+    pub async fn restore_weekly_budget_without_charge_history(&self, id: &str) {
+        // 模拟业务恢复后只有累计金额、窗口早于费用历史起点的账本
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "update {}.client_api_key_budget_windows set
+             weekly_start=date_trunc('milliseconds', now()) - interval '1 hour' + interval '456 microseconds',
+             weekly_end=date_trunc('milliseconds', now()) + interval '1 day' + interval '789 microseconds',
+             charge_history_since=now() where client_api_key_id=$1",
+            self.schema
+        )))
+        .bind(id)
+        .execute(&self.admin)
+        .await
+        .unwrap();
+    }
+
     pub async fn client_key_with_limits(
         &self,
         id: &str,
@@ -932,7 +947,7 @@ impl PricingSource for UnusedAdminRuntime {
 impl ProxyProbe for UnusedAdminRuntime {
     async fn test(
         &self,
-        _: Option<&gateway_core::account::OutboundProxy>,
+        _: gateway_admin::ports::proxy::ProbeRoute<'_>,
         _: bool,
     ) -> ProxyTestResult {
         panic!("unexpected proxy probe")

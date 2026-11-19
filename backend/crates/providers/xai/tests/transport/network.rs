@@ -184,11 +184,15 @@ async fn inference_and_oauth_connect_through_each_accounts_authenticated_proxy()
                 .unwrap()
                 .with_outbound_proxy(Some(proxy)),
         );
-        assert!(
-            tokio::time::timeout(Duration::from_secs(5), inference.execute(request))
-                .await
-                .unwrap()
-                .is_err()
+        let error = tokio::time::timeout(Duration::from_secs(5), inference.execute(request))
+            .await
+            .unwrap()
+            .expect_err("proxy rejects CONNECT");
+        assert_eq!(
+            error
+                .diagnostic()
+                .and_then(|diagnostic| diagnostic.proxy_hint()),
+            Some(gateway_core::error::ProxyConnectionHint::CheckProxy)
         );
         let connect = tokio::time::timeout(Duration::from_secs(5), captured)
             .await
@@ -581,6 +585,7 @@ async fn inference_connect_failure_keeps_safe_diagnosis_without_endpoint_or_payl
         .await
         .expect_err("closed listener");
     let diagnostic = error.diagnostic().expect("transport cause");
+    assert_eq!(diagnostic.proxy_hint(), None);
     assert_eq!(diagnostic.stage(), Some("connect"));
     assert_eq!(diagnostic.code(), Some("connection_refused"));
     assert!(!diagnostic.as_str().contains("127.0.0.1"));
@@ -1412,4 +1417,43 @@ fn resolve_with_policy(
             Ok(addresses)
         }
     }
+}
+
+#[tokio::test]
+async fn official_xai_resolves_https_proxy_host_outside_the_direct_dns_allowlist() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    if std::env::var_os("CPR_TEST_XAI_PROXY").is_some() {
+        let client = OfficialGrokEndpointPolicy
+            .build_oauth_client(Some(Duration::from_secs(2)), None)
+            .unwrap();
+        assert!(client.get("https://auth.x.ai/").send().await.is_err());
+        return;
+    }
+    let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", "transport::network::official_xai_resolves_https_proxy_host_outside_the_direct_dns_allowlist"])
+        .env("CPR_TEST_XAI_PROXY", "1")
+        .env("HTTPS_PROXY", format!("http://localhost:{}", server.local_addr().unwrap().port()))
+        .env("HTTP_PROXY", "").env("ALL_PROXY", "").env("NO_PROXY", "").env_remove("REQUEST_METHOD");
+    let observe = async {
+        let (socket, _) = server.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        let mut line = String::new();
+        socket.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "CONNECT auth.x.ai:443 HTTP/1.1\r\n");
+        socket
+            .get_mut()
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    };
+    let (output, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            tokio::task::spawn_blocking(move || command.output()),
+            observe
+        )
+    })
+    .await
+    .unwrap();
+    assert!(output.unwrap().unwrap().status.success());
 }

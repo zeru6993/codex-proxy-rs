@@ -6,49 +6,54 @@ export type UsageErrorRecord = UsageErrorFacts & {
   logicalOutcome: string
 }
 
-// 只解释已记录的分类和关闭码，原始上游文案由详情保留
-export function usageErrorSummary(record: UsageErrorRecord): string | null {
-  if (record.websocketCloseCode != null) {
-    if (record.websocketCloseCode === 1012)
-      return t('usage.error.summary.upstreamRestart')
-    if (record.websocketCloseCode === 1013)
-      return t('usage.error.summary.upstreamBusy')
-    if (record.websocketCloseCode === 1009)
-      return t('usage.error.summary.messageTooLarge')
-    return t('usage.error.summary.upstreamClosed')
+export function usageDisplayOutcome(outcome: string, errorCode: string | null, errorKind: string | null): string {
+  // 已开始交付的请求仍可能明确失败，展示不改变原始终态
+  // 进程中断和缺少明确错误的断流保留未完成，不从 HTTP 状态或文案推断
+  if (outcome === 'incomplete' && errorKind !== 'process_interrupted' && (errorCode || errorKind === 'timeout'))
+    return 'failed'
+  return outcome
+}
+
+export function usageErrorTitle(record: Pick<UsageErrorRecord, 'logicalOutcome' | 'errorCode' | 'errorKind'>): string {
+  return usageDisplayOutcome(record.logicalOutcome, record.errorCode, record.errorKind) === 'incomplete'
+    ? t('usage.error.responseIsNotComplete')
+    : t('usage.error.requestFailed')
+}
+
+export function usageErrorOrigin(record: Pick<UsageErrorFacts, 'errorOrigin'>) {
+  const origins = {
+    proxy: {
+      label: t('usage.error.origin.proxy'),
+      className: 'text-z-blue-text',
+      hint: null,
+    },
+    upstream: {
+      label: t('usage.error.origin.upstream'),
+      className: 'text-z-error-text',
+      hint: null,
+    },
+    connection: {
+      label: t('usage.error.origin.connection'),
+      className: 'text-z-warning-text',
+      hint: t('usage.error.origin.connectionHint'),
+    },
+    unknown: {
+      label: t('usage.error.origin.unknown'),
+      className: 'text-z-text-secondary',
+      hint: t('usage.error.origin.unknownHint'),
+    },
   }
+  return { kind: record.errorOrigin, ...origins[record.errorOrigin] }
+}
 
-  if (record.errorKind === 'process_interrupted')
-    return t('usage.error.summary.processInterrupted')
-
-  if (record.errorKind === 'continuation_recovery_required') {
-    if (record.continuationUnavailableReason === 'reused_connection_lost'
-      && record.upstreamConnectionExitReason === 'max_age_expired') {
-      return t('usage.error.summary.continuationExpired')
-    }
-    return t('usage.error.summary.continuationUnavailable')
+export function usageSendStateText(state: string) {
+  switch (state) {
+    case 'not_sent': return t('usage.error.sendState.notSent')
+    case 'sent': return t('usage.error.sendState.sent')
+    case 'ambiguous': return t('usage.error.sendState.ambiguous')
+    case 'unknown': return t('usage.error.responseNotRecorded')
+    default: return state
   }
-
-  if (record.provider === 'openai') {
-    switch (record.errorCode) {
-      case 'previous_response_not_found':
-        return t('usage.error.summary.continuationUnavailable')
-      case 'websocket_connection_limit_reached':
-        return t('usage.error.summary.connectionLimit')
-      case 'context_length_exceeded':
-        return t('usage.error.summary.contextTooLong')
-      case 'insufficient_quota':
-        return t('usage.error.summary.quotaExceeded')
-      case 'rate_limit_exceeded':
-        return t('usage.error.summary.rateLimited')
-      case 'server_is_overloaded':
-        return t('usage.error.summary.serverOverloaded')
-    }
-  }
-
-  if (record.upstreamConnectionExitReason === 'upstream_close')
-    return t('usage.error.summary.upstreamClosed')
-  return null
 }
 
 export function usageErrorCode(record: UsageErrorFacts): string | null {

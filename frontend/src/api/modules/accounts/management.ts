@@ -1,5 +1,5 @@
 import type { RequestOptions } from '../../request'
-import type { Account, AccountIdParam, AccountModelAccess, AccountRefreshResponse } from './types'
+import type { Account, AccountIdParam, AccountModelAccess, AccountQuotaBucketSettings, AccountRefreshResponse } from './types'
 import request from '../../request'
 
 export interface AccountPageMeta {
@@ -12,6 +12,7 @@ export interface AccountPageMeta {
 export interface AccountSummary {
   total: number
   normal: number
+  quotaPaused: number
   quotaExhausted: number
   rateLimited: number
   disabled: number
@@ -52,7 +53,7 @@ interface AccountListParams {
 }
 
 interface AccountUpdateParam {
-  connection?: { baseUrl?: string, transport: ApiKeyConfiguration['transport'], apiKey?: string }
+  connection?: { baseUrl?: string, protocol?: ApiKeyConfiguration['protocol'], transport: ApiKeyConfiguration['transport'], apiKey?: string }
   outboundProxyUrl?: string
   outboundProxyId?: string
   accountId: string
@@ -66,6 +67,7 @@ interface AccountUpdateParam {
 }
 
 interface AccountBatchUpdateParam {
+  quotaSettings?: Record<string, AccountQuotaBucketSettings>
   autoUseQuotaCredits?: boolean
   outboundProxyUrl?: string
   outboundProxyId?: string
@@ -94,6 +96,7 @@ interface AccountConcurrencyParams extends AccountIdParam {
 
 export interface ApiKeyConfiguration {
   base_url: string
+  protocol: 'responses' | 'messages'
   transport: 'http' | 'prefer_websocket'
 }
 

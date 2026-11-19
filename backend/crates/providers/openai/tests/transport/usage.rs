@@ -83,6 +83,28 @@ fn gpt_6_models_should_use_published_prices_across_tiers_and_context_boundary() 
     // 每档依次核对每百万 Token 的输入、缓存读取、缓存写入和输出价格
     for (model, cases) in [
         (
+            "gpt-6.2-astra",
+            [
+                (None, 272_000, ["8", "0.4", "10", "40"]),
+                (None, 272_001, ["16", "0.8", "20", "60"]),
+                (Some("fast"), 272_000, ["16", "0.8", "20", "80"]),
+                (Some("priority"), 272_001, ["32", "1.6", "40", "120"]),
+                (Some("ultrafast"), 272_000, ["48", "2.4", "60", "240"]),
+                (Some("ultrafast"), 272_001, ["96", "4.8", "120", "360"]),
+            ],
+        ),
+        (
+            "gpt-6.2-sol",
+            [
+                (None, 272_000, ["2", "0.1", "2.5", "10"]),
+                (None, 272_001, ["4", "0.2", "5", "15"]),
+                (Some("fast"), 272_000, ["4", "0.2", "5", "20"]),
+                (Some("priority"), 272_001, ["8", "0.4", "10", "30"]),
+                (Some("ultrafast"), 272_000, ["12", "0.6", "15", "60"]),
+                (Some("ultrafast"), 272_001, ["24", "1.2", "30", "90"]),
+            ],
+        ),
+        (
             "gpt-6.1-sol",
             [
                 (None, 272_000, ["2", "0.1", "2.5", "10"]),
@@ -457,6 +479,10 @@ fn billing_should_not_inherit_prices_for_unknown_models_or_tiers() {
         ("gpt-5.5-cyber", 272_001, None),
         ("gpt-5.6-cyber", 1, Some("fast")),
         ("gpt-5.3-codex", 1, Some("flex")),
+        ("gpt-6.2-astra", 1, Some("flex")),
+        ("gpt-6.2-astra", 272_001, Some("flex")),
+        ("gpt-6.2-sol", 1, Some("flex")),
+        ("gpt-6.2-sol", 272_001, Some("flex")),
         ("gpt-6-astra", 1, Some("auto")),
         ("gpt-6-astra", 1, Some("future")),
         ("gpt-6.1-terra", 1, Some("ultrafast")),
@@ -516,8 +542,6 @@ async fn fetch_should_use_wham_usage_headers_only() {
             request_id: "req_usage_headers",
             turn_state: Some("turn-state"),
             turn_metadata: Some("turn-meta"),
-            beta_features: Some("feature-a"),
-            include_timing_metrics: Some("true"),
             version: Some("26.318.11754"),
             codex_window_id: Some("cw_1"),
             parent_thread_id: Some("parent-1"),
@@ -526,7 +550,6 @@ async fn fetch_should_use_wham_usage_headers_only() {
             session_id: Some("session-1"),
             thread_id: Some("thread-1"),
             client_request_id: Some("client-request-1"),
-            turn_id: Some("turn-1"),
             account_selection: Default::default(),
         })
         .await
@@ -917,8 +940,6 @@ fn context() -> CodexRequestContext<'static> {
         request_id: "req_usage_limit",
         turn_state: None,
         turn_metadata: None,
-        beta_features: None,
-        include_timing_metrics: None,
         version: None,
         codex_window_id: None,
         parent_thread_id: None,
@@ -927,7 +948,6 @@ fn context() -> CodexRequestContext<'static> {
         session_id: None,
         thread_id: None,
         client_request_id: None,
-        turn_id: None,
         account_selection: Default::default(),
     }
 }

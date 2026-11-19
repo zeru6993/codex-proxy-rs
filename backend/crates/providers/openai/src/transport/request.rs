@@ -5,7 +5,8 @@ use std::io;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gateway_core::operation::GenerateRequest;
 use gateway_protocol::openai::{
-    WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY, is_transport_managed_request_header,
+    OPENAI_PROTOCOL, WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY,
+    is_transport_managed_request_header,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use roxmltree::Document;
@@ -20,8 +21,7 @@ use crate::transport::protocol::responses::{
     CodexResponsesRequest, X_CODEX_TURN_STATE_CLIENT_METADATA_KEY,
 };
 
-const PASSTHROUGH_HEADERS_CONTEXT_KEY: &str = "opaque_request_headers";
-const TURN_ID_CLIENT_METADATA_KEY: &str = "turn_id";
+pub(crate) const PASSTHROUGH_HEADERS_CONTEXT_KEY: &str = "opaque_request_headers";
 const THREAD_SPAWN_SUBAGENT_KIND: &str = "thread_spawn";
 const THREAD_SPAWN_CONVERSATION_PREFIX: &str = "thread-spawn:";
 const ENVIRONMENT_CONTEXT_CONTENT_KIND: &str = "environments.environment_context";
@@ -108,7 +108,7 @@ pub fn encode_generate_request(
     location: Option<&CodexRequestLocation>,
 ) -> Result<CodexResponsesRequest, CodexRequestEncodeError> {
     let payload = request.protocol_payload();
-    if payload.protocol() != "openai" {
+    if payload.protocol() != OPENAI_PROTOCOL {
         return Err(CodexRequestEncodeError::InvalidProtocolPayload);
     }
     let mut body = payload.body().clone();
@@ -255,14 +255,11 @@ fn extract_request_context(request: &mut CodexResponsesRequest) {
     let context = ExtractedRequestContext::from_body(request.body());
     request.turn_state = context.turn_state;
     request.turn_metadata = context.turn_metadata;
-    request.beta_features = context.beta_features;
     request.version = context.version;
-    request.include_timing_metrics = context.include_timing_metrics;
     request.codex_window_id = context.codex_window_id;
     request.parent_thread_id = context.parent_thread_id;
     request.client_conversation_id = context.conversation_id;
     request.client_request_id = context.client_request_id;
-    request.client_turn_id = context.turn_id;
     request.responses_lite = context.responses_lite;
     request.memgen_request = context.memgen_request;
 }
@@ -270,14 +267,11 @@ fn extract_request_context(request: &mut CodexResponsesRequest) {
 struct ExtractedRequestContext {
     turn_state: Option<String>,
     turn_metadata: Option<String>,
-    beta_features: Option<String>,
     version: Option<String>,
-    include_timing_metrics: Option<String>,
     codex_window_id: Option<String>,
     parent_thread_id: Option<String>,
     conversation_id: Option<String>,
     client_request_id: Option<String>,
-    turn_id: Option<String>,
     responses_lite: Option<String>,
     memgen_request: Option<String>,
 }
@@ -286,26 +280,18 @@ impl ExtractedRequestContext {
     fn from_body(body: &Map<String, Value>) -> Self {
         let client_metadata = body.get("client_metadata").and_then(Value::as_object);
         Self {
-            // 官方 downstream WebSocket 无法逐帧更新 HTTP header，因此把
-            // response.metadata 返回的 turn state 放回下一帧 client_metadata
-            // Provider 仍会在账号/turn 归属确定后决定是否允许复用该状态
+            // 下游 WS 在每个 response.create 的 client_metadata 回传本轮路由状态
             turn_state: body_string(body, "turnState").or_else(|| {
                 client_metadata.and_then(|metadata| {
                     string_value(metadata.get(X_CODEX_TURN_STATE_CLIENT_METADATA_KEY))
                 })
             }),
             turn_metadata: body_string(body, "turnMetadata"),
-            beta_features: body_string(body, "betaFeatures"),
             version: body_string(body, "version"),
-            include_timing_metrics: body_string(body, "includeTimingMetrics"),
             codex_window_id: body_string(body, "codexWindowId"),
             parent_thread_id: body_string(body, "parentThreadId"),
             conversation_id: body_string(body, "conversation_id"),
             client_request_id: body_string(body, "x-client-request-id"),
-            turn_id: body_string(body, "turn_id").or_else(|| {
-                client_metadata
-                    .and_then(|metadata| string_value(metadata.get(TURN_ID_CLIENT_METADATA_KEY)))
-            }),
             // Responses Lite 在 WebSocket body 中的这个键是官方 header 投影，
             // 不是普通上下文字段的 metadata 回退
             responses_lite: client_metadata.and_then(|metadata| {
@@ -451,8 +437,8 @@ fn normalize_conversation_anchor_text(text: &str) -> String {
     rest.to_owned()
 }
 
-/// 已确认换轮或换号时，各 wire 入口同步清理原有路由 token
-pub(crate) fn clear_request_turn_state(request: &mut CodexResponsesRequest) {
+/// 明确换号时，同步清除请求头与正文中的原账号路由 token
+fn clear_request_turn_state(request: &mut CodexResponsesRequest) {
     request.turn_state = None;
     request.passthrough_headers.remove("x-codex-turn-state");
     for key in TURN_STATE_KEYS {
@@ -744,20 +730,24 @@ fn replace_metadata_field(metadata: &mut Map<String, Value>, key: &str, value: O
 // 请求头的场景)
 fn apply_protocol_context(request: &mut CodexResponsesRequest, context: &Map<String, Value>) {
     request.passthrough_headers = decode_passthrough_headers(context);
-    request.turn_state =
-        context_string(context, "turn_state").or_else(|| request.turn_state.take());
+    request.websocket_frame = context
+        .get(gateway_protocol::openai::WEBSOCKET_FRAME_CONTEXT_KEY)
+        .and_then(Value::as_bool)
+        == Some(true);
     request.turn_metadata =
         context_string(context, "turn_metadata").or_else(|| request.turn_metadata.take());
-    request.beta_features =
-        context_string(context, "beta_features").or_else(|| request.beta_features.take());
     request.version = context_string(context, "version").or_else(|| request.version.take());
-    request.include_timing_metrics = context_string(context, "include_timing_metrics")
-        .or_else(|| request.include_timing_metrics.take());
     request.codex_window_id =
         context_string(context, "codex_window_id").or_else(|| request.codex_window_id.take());
     request.downstream_websocket_connection_id =
         context_string(context, "downstream_websocket_connection_id")
             .or_else(|| request.downstream_websocket_connection_id.take());
+    if request.downstream_websocket_connection_id.is_some() && request.turn_state.is_some() {
+        // 当前帧的路由状态优先于握手值，原始握手头也不能覆盖出站投影
+        request.passthrough_headers.remove("x-codex-turn-state");
+    } else if let Some(state) = context_string(context, "turn_state") {
+        request.turn_state = Some(state);
+    }
     request.parent_thread_id =
         context_string(context, "parent_thread_id").or_else(|| request.parent_thread_id.take());
     let prompt_cache_key = request.prompt_cache_key().map(ToOwned::to_owned);
@@ -772,8 +762,6 @@ fn apply_protocol_context(request: &mut CodexResponsesRequest, context: &Map<Str
     request.client_thread_id = gateway_protocol::openai::codex_thread_id(request.body(), context);
     request.client_request_id =
         context_string(context, "client_request_id").or_else(|| request.client_request_id.take());
-    request.client_turn_id =
-        context_string(context, "turn_id").or_else(|| request.client_turn_id.take());
     request.responses_lite =
         context_string(context, "responses_lite").or_else(|| request.responses_lite.take());
     request.memgen_request =

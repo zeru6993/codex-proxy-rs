@@ -21,6 +21,7 @@ pub use gateway_core::account::{
 /// 账号可用的管理操作
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderAccountCapabilities {
+    pub quota_settings_supported: bool,
     pub quota_credits: bool,
     pub quota: bool,
     pub quota_refresh: bool,
@@ -111,6 +112,8 @@ pub enum AccountGroupFilter {
 /// 账号公共存储投影；Provider 专属字段不进入此结构
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRecord {
+    pub quota_paused: bool,
+    pub quota_settings: gateway_core::account::AccountQuotaSettings,
     pub auto_use_quota_credits: bool,
     pub id: String,
     pub provider_kind: ProviderKind,
@@ -143,7 +146,7 @@ pub struct AccountRecord {
 }
 
 impl AccountRecord {
-    /// 配置保留绑定，执行请求时禁用代理按直连处理
+    /// 配置保留绑定，执行请求时禁用代理使用部署默认出口
     #[must_use]
     pub fn effective_outbound_proxy(&self) -> Option<&gateway_core::account::OutboundProxy> {
         self.outbound_proxy
@@ -251,6 +254,7 @@ pub struct AccountUpdateResult {
 /// 仅修改显式字段的批量账号设置命令
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchUpdateAccounts {
+    pub quota_settings: Option<gateway_core::account::AccountQuotaSettings>,
     pub auto_use_quota_credits: Option<bool>,
     pub account_ids: Vec<String>,
     pub enabled: Option<bool>,
@@ -260,6 +264,18 @@ pub struct BatchUpdateAccounts {
     pub group_ids: Option<Vec<gateway_core::routing::AccountGroupId>>,
     pub outbound_proxy: Option<super::proxies::AccountProxySelection>,
 }
+
+/// 已按拟提交策略重算的账号暂停结果，以快照版本防止旧判断覆盖新观测
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedQuotaPause {
+    pub settings: gateway_core::account::AccountQuotaSettings,
+    pub previous_settings: gateway_core::account::AccountQuotaSettings,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub revision: Revision,
+    pub paused: bool,
+}
+
+pub type PreparedQuotaPauses = std::collections::BTreeMap<String, PreparedQuotaPause>;
 
 /// 批量账号更新结果
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,6 +309,7 @@ pub enum AccountConnectionTestEvent {
     Failed {
         source: AccountProbeErrorSource,
         gateway_error_code: GatewayErrorKind,
+        proxy_hint: Option<gateway_core::error::ProxyConnectionHint>,
         send_state: Option<UpstreamSendState>,
         message: String,
         provider_error_code: Option<String>,

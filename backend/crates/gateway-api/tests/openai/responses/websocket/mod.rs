@@ -19,7 +19,7 @@ use axum::{
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt, future::BoxFuture};
 use gateway_api::openai::responses::{
-    DecodedResponsesRequest, OpenAiRequestHeaders, ResponseCreateFrameError,
+    DecodedGenerationRequest, OpenAiRequestHeaders, ResponseCreateFrameError,
     decode_response_create_with_context,
 };
 use gateway_core::account::ProviderAccountId;
@@ -69,7 +69,7 @@ use crate::openai::{
 fn decode_response_create_with_turn_header(
     payload: Value,
     opening_turn_metadata: &'static str,
-) -> DecodedResponsesRequest {
+) -> DecodedGenerationRequest {
     let mut headers = HeaderMap::new();
     headers.insert(
         "x-codex-turn-metadata",
@@ -168,21 +168,31 @@ fn response_create_should_preserve_compaction_trigger_for_openai() {
 
 #[test]
 fn response_create_should_prefer_frame_turn_metadata_over_opening_headers() {
+    let frame = r#"{"request_kind":"turn","tool_namespaces_info":{"workspace":{}}}"#;
+    let opening = r#"{"request_kind":"compaction"}"#;
     let decoded = decode_response_create_with_turn_header(
         json!({
             "type": "response.create",
             "model": "smart-code",
             "input": "hello",
             "client_metadata": {
-                "x-codex-turn-metadata": r#"{"request_kind":"turn"}"#
+                "x-codex-turn-metadata": frame
             }
         }),
-        r#"{"request_kind":"compaction"}"#,
+        opening,
     );
     let Operation::Generate(request) = decoded.operation() else {
         panic!("Responses must map to Generate");
     };
 
+    assert_eq!(
+        request.protocol_payload().context()["turn_metadata"],
+        opening
+    );
+    assert_eq!(
+        request.protocol_payload().body()["client_metadata"]["x-codex-turn-metadata"],
+        frame
+    );
     let semantics = codex_responses_request_semantics(
         request.protocol_payload().body(),
         request.protocol_payload().context(),
@@ -308,6 +318,7 @@ struct AtomicFailureTrace {
     committed: AtomicBool,
     finalized: AtomicBool,
     downstream_websocket_connection_ids: Mutex<Vec<String>>,
+    request_turn_headers: Mutex<Vec<[Option<String>; 2]>>,
     initial_errors: Mutex<std::collections::VecDeque<EngineError>>,
     first_batch: Mutex<Option<CoordinatedEvent>>,
     session_drops: Arc<AtomicUsize>,
@@ -437,6 +448,11 @@ impl ExecutionService for AtomicFailureExecution {
                 .get("downstream_websocket_connection_id")
                 .and_then(Value::as_str)
         {
+            let context = generate.protocol_payload().context();
+            self.trace.request_turn_headers.lock().unwrap().push(
+                ["turn_state", "turn_metadata"]
+                    .map(|key| context.get(key).and_then(Value::as_str).map(str::to_owned)),
+            );
             self.trace
                 .downstream_websocket_connection_ids
                 .lock()
@@ -1114,6 +1130,7 @@ async fn websocket_disconnect_during_core_settlement_finishes_charge_before_rele
     let lifecycle = Arc::new(SettlementConnectionLifecycle::default());
     let admin = crate::admin::AdminTestFixture::new().await;
     let app = gateway_api::initialize(
+        uuid::Uuid::nil(),
         gateway_api::ApiConfig {
             asset_directory: std::env::temp_dir(),
             cors_allowed_origins: Vec::new(),
@@ -1210,12 +1227,16 @@ fn upgrade_request(authorization: &str) -> Request<Body> {
 
 #[tokio::test]
 async fn official_core_version_gate_should_run_before_websocket_upgrade() {
-    let app = api_router(ModelsExecution::with_cli_min("0.162.0")).await;
+    let app = api_router(ModelsExecution::with_cli_min("0.170.0")).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    for version in ["0.158.0", "0.162.0"] {
+    for (product, version) in [
+        ("codex-tui", "0.158.0"),
+        ("Codex Desktop", "0.168.0"),
+        ("Codex Desktop", "0.170.0"),
+    ] {
         let mut request = format!("ws://{address}/v1/responses")
             .into_client_request()
             .unwrap();
@@ -1226,12 +1247,12 @@ async fn official_core_version_gate_should_run_before_websocket_upgrade() {
         request.headers_mut().insert(
             "user-agent",
             HeaderValue::from_str(&format!(
-                "codex-tui/{version} (Mac OS 26.6.2; arm64) Apple_Terminal (codex-tui; 0.165.0)"
+                "{product}/{version} (Ubuntu 26.4.0; aarch64) xterm-256color (codex-tui; 0.169.0)"
             ))
             .unwrap(),
         );
         let result = connect_async(request).await;
-        if version == "0.162.0" {
+        if version == "0.170.0" {
             let (mut socket, response) = result.expect("current Core upgrades successfully");
             assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
             socket.close(None).await.unwrap();
@@ -1244,8 +1265,9 @@ async fn official_core_version_gate_should_run_before_websocket_upgrade() {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let value: Value = serde_json::from_slice(response.body().as_deref().unwrap()).unwrap();
             assert_eq!(value["error"]["code"], "client_version_too_old");
-            assert_eq!(value["error"]["current_version"], "0.158.0");
-            assert_eq!(value["error"]["min_version"], "0.162.0");
+            assert_eq!(value["error"]["client"], "codex_cli");
+            assert_eq!(value["error"]["current_version"], version);
+            assert_eq!(value["error"]["min_version"], "0.170.0");
         }
     }
     server.abort();

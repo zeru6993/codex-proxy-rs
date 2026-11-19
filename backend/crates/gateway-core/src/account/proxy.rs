@@ -3,6 +3,8 @@
 use std::fmt;
 use url::Url;
 
+use crate::upstream::ProxyEndpoint;
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct OutboundProxy {
     url: Url,
@@ -49,6 +51,26 @@ impl OutboundProxy {
     #[must_use]
     pub fn expose_url(&self) -> &str {
         self.url.as_str()
+    }
+
+    #[must_use]
+    pub fn dial_endpoint(&self) -> ProxyEndpoint {
+        ProxyEndpoint::new(
+            self.url.host_str().expect("validated proxy host"),
+            self.url
+                .port_or_known_default()
+                .expect("validated proxy port"),
+        )
+    }
+
+    #[must_use]
+    pub fn matches_endpoint(&self, endpoint: &ProxyEndpoint) -> bool {
+        endpoint.matches(
+            self.url.host_str().expect("validated proxy host"),
+            self.url
+                .port_or_known_default()
+                .expect("validated proxy port"),
+        )
     }
 
     #[must_use]

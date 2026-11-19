@@ -568,6 +568,7 @@ async fn xai_admin_provider_projects_cached_quota_models_and_canonical_export() 
     );
     store
         .compare_and_swap_quota(gateway_core::account::QuotaObservation {
+            quota_pause: None,
             expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
@@ -768,6 +769,8 @@ fn provider_ports_with_catalog(
 fn account_record(account: &ProviderAccount) -> AccountRecord {
     let now = Utc::now();
     AccountRecord {
+        quota_paused: false,
+        quota_settings: Default::default(),
         auto_use_quota_credits: false,
         outbound_proxy_id: None,
         outbound_proxy_enabled: true,
@@ -824,6 +827,7 @@ impl ProviderLeasePort for TestLeases {
                             in_flight: 0,
                             last_started_at: None,
                             quota_reset_at: None,
+                            quota_reset_windows: None,
                             quota_remaining_rank: None,
                             cooldown: None,
                             failure_rate_basis_points: None,

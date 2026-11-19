@@ -100,7 +100,9 @@ fn contract_type(mut item: Item, name: &str) -> Item {
     attrs.retain(|attr| attr.path().is_ident("serde"));
     attrs.insert(
         0,
-        if name == "SmartSchedulingConfig" {
+        if name == "ResetWindowWeights" {
+            parse_quote!(#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)])
+        } else if name == "SmartSchedulingConfig" {
             parse_quote!(#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)])
         } else if comparable {
             parse_quote!(#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)])
@@ -255,8 +257,8 @@ fn sdk_settings_contract_matches_host_declarations() {
             &["RequestLocation"][..],
         ),
         (
-            "../gateway-core/src/account/smart_scheduling.rs",
-            &["SmartSchedulingValues"][..],
+            "../gateway-core/src/account/scheduling.rs",
+            &["SmartSchedulingValues", "ResetWindowValues"][..],
         ),
         (
             "../gateway-core/src/metering/pricing.rs",
@@ -324,10 +326,10 @@ fn sdk_settings_contract_matches_host_declarations() {
             }
             types.push(contract_type(
                 item,
-                if *name == "SmartSchedulingValues" {
-                    "SmartSchedulingConfig"
-                } else {
-                    name
+                match *name {
+                    "SmartSchedulingValues" => "SmartSchedulingConfig",
+                    "ResetWindowValues" => "ResetWindowWeights",
+                    _ => name,
                 },
             ));
         }

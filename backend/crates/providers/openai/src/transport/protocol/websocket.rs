@@ -198,7 +198,7 @@ pub fn websocket_response_create_payload(request: &CodexResponsesRequest) -> Val
     Value::Object(payload)
 }
 
-/// 借用原始 body 序列化 `response.create` 帧，不复制字段
+/// 借用原始 body 序列化 `response.create` 消息，不复制字段
 ///
 /// 输出与序列化 [`websocket_response_create_payload`] 的合并 Map 逐字节一致：
 /// body 自带 `type` 键时以 body 值置于首位，其余字段按插入顺序原样透传
@@ -224,42 +224,13 @@ impl serde::Serialize for ResponseCreateFrame<'_> {
     }
 }
 
-/// 生成 Responses WebSocket `response.create` 文本帧内容
+/// 生成 Responses WebSocket `response.create` 消息的完整文本
 pub fn websocket_response_create_payload_text(
     request: &CodexResponsesRequest,
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string(&ResponseCreateFrame {
         body: request.body(),
     })
-}
-
-pub(crate) fn websocket_response_create_payload_len(
-    request: &CodexResponsesRequest,
-) -> Result<usize, serde_json::Error> {
-    struct ByteCount(usize);
-
-    impl std::io::Write for ByteCount {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_add(bytes.len())
-                .ok_or_else(|| std::io::Error::other("WebSocket payload size overflow"))?;
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut count = ByteCount(0);
-    serde_json::to_writer(
-        &mut count,
-        &ResponseCreateFrame {
-            body: request.body(),
-        },
-    )?;
-    Ok(count.0)
 }
 
 fn websocket_payload_keys(request: &CodexResponsesRequest) -> Vec<String> {

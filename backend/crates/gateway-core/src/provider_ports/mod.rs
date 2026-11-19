@@ -10,8 +10,9 @@ pub use lease::{
 };
 mod affinity;
 pub use affinity::{
-    ProviderSessionAffinityKey, ProviderSessionAffinityPort, ProviderSessionAlias,
-    ProviderSessionBinding, ProviderSessionExclusionPort, ProviderSessionExclusions,
+    ProviderAccountAdmission, ProviderSessionAffinityKey, ProviderSessionAffinityPort,
+    ProviderSessionAlias, ProviderSessionBinding, ProviderSessionClaim,
+    ProviderSessionExclusionPort, ProviderSessionExclusions,
 };
 mod catalog;
 pub use catalog::{
@@ -28,9 +29,7 @@ pub use cooldown::{
 mod refresh;
 pub use refresh::{ProviderRefreshPolicy, provider_refresh_backoff_at, provider_refresh_retry_at};
 mod runtime_policy;
-pub use runtime_policy::{
-    ProviderRuntimePolicyPort, ProviderWarmupPolicy, valid_warmup_schedule_time,
-};
+pub use runtime_policy::{ProviderRuntimePolicyPort, ProviderWarmupPolicy, valid_warmup_cron};
 mod oauth;
 pub use oauth::{
     NewOAuthPendingFlow, OAuthPendingBinding, OAuthPendingClaimOutcome, OAuthPendingConsumeOutcome,

@@ -6,12 +6,14 @@ use std::num::NonZeroU64;
 use bytes::Bytes;
 use gateway_core::operation::RawJsonPayload;
 use gateway_core::routing::{ModelServiceTier, UpstreamModelId};
+use gateway_protocol::anthropic::MessagesModelCapabilities;
+use gateway_protocol::openai::OPENAI_PROTOCOL;
 use reqwest::header::{ETAG, HeaderMap};
 use serde::Deserialize;
 
 use super::client::OpenAiUpstreamProtocol;
 
-const MAX_CATALOG_MODELS: usize = 2_048;
+pub(super) const MAX_CATALOG_MODELS: usize = 2_048;
 const MAX_DISPLAY_NAME_BYTES: usize = 256;
 const MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
 const MAX_SERVICE_TIER_ID_BYTES: usize = 64;
@@ -189,9 +191,15 @@ pub struct CodexCatalogModel {
     capabilities: CodexCatalogCapabilities,
     limits: CodexCatalogLimits,
     metadata: CodexCatalogMetadata,
+    messages: Option<MessagesModelCapabilities>,
 }
 
 impl CodexCatalogModel {
+    /// Messages 上游明确提供的模型能力，不与其他账号的同名模型合并
+    pub(crate) fn messages_capabilities(&self) -> Option<&MessagesModelCapabilities> {
+        self.messages.as_ref()
+    }
+
     /// 完整原生对象只用于客户端目录，不写入控制面画像或日志
     #[must_use]
     pub const fn document(&self) -> &RawJsonPayload {
@@ -230,13 +238,40 @@ impl CodexCatalogModel {
 }
 
 /// 一次完整成功的 Codex 远端模型快照
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CodexModelCatalogSnapshot {
+    document: Bytes,
     models: Vec<CodexCatalogModel>,
     etag: Option<String>,
 }
 
+impl std::fmt::Debug for CodexModelCatalogSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexModelCatalogSnapshot")
+            .field("models", &self.models)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CodexModelCatalogSnapshot {
+    pub(crate) fn into_parts(self) -> (Vec<CodexCatalogModel>, Bytes, Option<String>) {
+        (self.models, self.document, self.etag)
+    }
+
+    /// 落库的目录沿用相同的上游校验器；协议标记区分普通 API 与 Messages 能力
+    pub(crate) fn restore(document: &[u8]) -> Result<Self, CodexModelCatalogError> {
+        match document.split_first() {
+            Some((0, body)) => parse_codex_model_catalog(body, None),
+            Some((1, body)) => {
+                parse_api_model_catalog(body, None, OpenAiUpstreamProtocol::ResponsesApi)
+            }
+            Some((2, body)) => {
+                parse_api_model_catalog(body, None, OpenAiUpstreamProtocol::MessagesApi)
+            }
+            _ => Err(CodexModelCatalogError::InvalidWire),
+        }
+    }
+
     /// 返回本轮全部模型
     #[must_use]
     pub fn models(&self) -> &[CodexCatalogModel] {
@@ -282,7 +317,7 @@ pub enum CodexModelCatalogError {
     InvalidEtag,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 struct CodexModelsWire {
     models: Vec<serde_json::Value>,
 }
@@ -354,6 +389,7 @@ fn parse_native_model_catalog(
         return Err(CodexModelCatalogError::TooManyModels);
     }
 
+    let document = archive(protocol, &wire)?;
     let etag = etag.map(validate_etag).transpose()?;
     let mut seen = BTreeSet::new();
     let mut models = Vec::with_capacity(wire.models.len());
@@ -373,7 +409,11 @@ fn parse_native_model_catalog(
         }
         models.push(model);
     }
-    Ok(CodexModelCatalogSnapshot { models, etag })
+    Ok(CodexModelCatalogSnapshot {
+        document,
+        models,
+        etag,
+    })
 }
 
 pub(super) fn catalog_etag(headers: &HeaderMap) -> Result<Option<String>, CodexModelCatalogError> {
@@ -437,6 +477,7 @@ fn normalize_model(
     }
 
     Ok(CodexCatalogModel {
+        messages: None,
         document,
         request_model,
         display_name: wire.display_name,
@@ -593,9 +634,10 @@ fn validate_etag(value: &str) -> Result<String, CodexModelCatalogError> {
 }
 
 /// 标准 API 模型 ID 遵循核心 ID 合同，不套用 Codex slug 语法或推断原生画像
-pub(crate) fn parse_api_model_catalog(
+pub(super) fn parse_api_model_catalog(
     body: &[u8],
     etag: Option<&str>,
+    protocol: OpenAiUpstreamProtocol,
 ) -> Result<CodexModelCatalogSnapshot, CodexModelCatalogError> {
     #[derive(Deserialize)]
     struct ApiModels {
@@ -605,13 +647,33 @@ pub(crate) fn parse_api_model_catalog(
     struct ApiModel {
         id: String,
         display_name: Option<String>,
+        #[serde(flatten)]
+        fields: serde_json::Map<String, serde_json::Value>,
     }
-    let value: serde_json::Value =
+    let mut value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| CodexModelCatalogError::InvalidWire)?;
     // 部分 Responses 上游按客户端版本返回完整 Codex 目录；不能降格为只有 ID 的画像
     if value.get("models").is_some() {
         return parse_native_model_catalog(body, etag, OpenAiUpstreamProtocol::ResponsesApi);
     }
+    if let Some(top) = value.as_object_mut() {
+        top.retain(|key, _| key == "data");
+    }
+    if let Some(items) = value
+        .get_mut("data")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in items {
+            if let Some(fields) = item.as_object_mut() {
+                fields.retain(|key, _| {
+                    matches!(key.as_str(), "id" | "display_name")
+                        || protocol == OpenAiUpstreamProtocol::MessagesApi
+                            && matches!(key.as_str(), "capabilities" | "max_tokens")
+                });
+            }
+        }
+    }
+    let document = archive(protocol, &value)?;
     let wire: ApiModels =
         serde_json::from_value(value).map_err(|_| CodexModelCatalogError::InvalidWire)?;
     if wire.data.is_empty() {
@@ -623,6 +685,9 @@ pub(crate) fn parse_api_model_catalog(
     let mut seen = BTreeSet::new();
     let mut models = Vec::with_capacity(wire.data.len());
     for item in wire.data {
+        let messages = (protocol == OpenAiUpstreamProtocol::MessagesApi).then(|| {
+            MessagesModelCapabilities::from_model(&serde_json::Value::Object(item.fields))
+        });
         if item.id.trim() != item.id {
             return Err(CodexModelCatalogError::InvalidModelSlug);
         }
@@ -633,7 +698,7 @@ pub(crate) fn parse_api_model_catalog(
             .unwrap_or_else(|| request_model.as_str().to_owned());
         validate_public_text(&display_name, MAX_DISPLAY_NAME_BYTES, false)?;
         let document = RawJsonPayload::new(
-            "openai",
+            OPENAI_PROTOCOL,
             Bytes::from(
                 serde_json::to_vec(&serde_json::json!({"id": request_model.as_str()}))
                     .map_err(|_| CodexModelCatalogError::InvalidWire)?,
@@ -644,6 +709,7 @@ pub(crate) fn parse_api_model_catalog(
             return Err(CodexModelCatalogError::DuplicateModelSlug);
         }
         models.push(CodexCatalogModel {
+            messages,
             document,
             request_model,
             display_name,
@@ -653,7 +719,21 @@ pub(crate) fn parse_api_model_catalog(
         });
     }
     Ok(CodexModelCatalogSnapshot {
+        document,
         models,
         etag: etag.map(validate_etag).transpose()?,
     })
+}
+
+fn archive(
+    protocol: OpenAiUpstreamProtocol,
+    value: &impl serde::Serialize,
+) -> Result<Bytes, CodexModelCatalogError> {
+    let mut bytes = vec![match protocol {
+        OpenAiUpstreamProtocol::Codex => 0,
+        OpenAiUpstreamProtocol::ResponsesApi => 1,
+        OpenAiUpstreamProtocol::MessagesApi => 2,
+    }];
+    serde_json::to_writer(&mut bytes, value).map_err(|_| CodexModelCatalogError::InvalidWire)?;
+    Ok(bytes.into())
 }
